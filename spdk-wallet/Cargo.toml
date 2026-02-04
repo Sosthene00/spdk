@@ -13,6 +13,7 @@ backend-blindbit-v1 = { workspace = true, optional = true }
 
 anyhow.workspace = true
 bitcoin.workspace = true
+bip322.workspace = true
 futures.workspace = true
 serde.workspace = true
 silentpayments.workspace = true
