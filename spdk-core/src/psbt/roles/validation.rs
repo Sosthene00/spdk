@@ -450,19 +450,19 @@ fn validate_dleq_proofs(secp: &Secp256k1<secp256k1::All>, psbt: &SilentPaymentPs
 
 /// Validate that a PSBT is ready for extraction
 ///
-/// Checks that all inputs are signed (either P2WPKH with `partial_sigs` or P2TR with `tap_key_sig`)
-/// and all outputs have scripts.
+/// Checks that all inputs have been finalized (via `finalize_input_witnesses`) and
+/// all outputs have scripts. Inputs must carry `PSBT_IN_FINAL_SCRIPTWITNESS` or
+/// `PSBT_IN_FINAL_SCRIPTSIG` before extraction.
 pub fn validate_ready_for_extraction(psbt: &SilentPaymentPsbt) -> Result<()> {
     for input_idx in 0..psbt.num_inputs() {
         let input = &psbt.inputs[input_idx];
 
-        // Check for either tap_key_sig (P2TR) or partial_sigs (P2WPKH)
-        let has_tap_sig = input.tap_key_sig.is_some();
-        let has_partial_sigs = !psbt.get_input_partial_sigs(input_idx).is_empty();
+        let is_finalized =
+            input.final_script_witness.is_some() || input.final_script_sig.is_some();
 
-        if !has_tap_sig && !has_partial_sigs {
+        if !is_finalized {
             return Err(Error::ExtractionFailed(format!(
-                "Input {} is not signed (no tap_key_sig or partial_sigs)",
+                "Input {} is not finalized (no final_script_witness or final_script_sig) — call finalize_input_witnesses first",
                 input_idx
             )));
         }

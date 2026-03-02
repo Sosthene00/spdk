@@ -1,59 +1,43 @@
 //! PSBT Extractor Role
 //!
-//! Extracts the final Bitcoin transaction from a completed PSBT.
-//!
-//! Supports both P2WPKH and P2TR witness extraction:
-//! - **P2WPKH**: Extracts from `partial_sigs` → witness: `[<ecdsa_sig>, <pubkey>]`
-//! - **P2TR**: Extracts from `tap_key_sig` → witness: `[<schnorr_sig>]`
-//!
-//! After successful extraction, `PSBT_IN_SP_TWEAK` fields are cleaned up to prevent
-//! accidental re-use and keep PSBTs cleaner.
+//! Extracts the final Bitcoin transaction from a finalized PSBT.
+//! Inputs must be finalized (via `finalize_input_witnesses`) before extraction —
+//! the extractor reads `PSBT_IN_FINAL_SCRIPTWITNESS` / `PSBT_IN_FINAL_SCRIPTSIG`
+//! only and does not inspect intermediate signing fields.
 
-use crate::psbt::core::{Bip375PsbtExt, Error, Result, SilentPaymentPsbt};
+use crate::psbt::core::{Error, Result, SilentPaymentPsbt};
 use bitcoin::{
     absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
 
-/// Extract the final signed transaction from a PSBT
+/// Extract the final signed transaction from a PSBT.
 ///
-/// After successful extraction, cleans up `PSBT_IN_SP_TWEAK` fields to prevent
-/// accidental re-use and keep PSBTs cleaner.
-///
-/// # Note
-/// This function takes a mutable reference to allow cleanup of SP tweaks.
-pub fn extract_transaction(psbt: &mut SilentPaymentPsbt) -> Result<Transaction> {
+/// Inputs must have been finalized via `finalize_input_witnesses` first.
+/// All intermediate signing fields are cleared by the finalizer; this function
+/// is a pure read-only transform from finalized PSBT to `Transaction`.
+pub fn extract_transaction(psbt: &SilentPaymentPsbt) -> Result<Transaction> {
     let global = &psbt.global;
     let version = global.tx_version;
     let lock_time = global.fallback_lock_time.unwrap_or(LockTime::ZERO);
 
     // Extract inputs with witnesses
     let mut inputs = Vec::new();
-    for input_idx in 0..psbt.num_inputs() {
+    for input_idx in 0..psbt.inputs.len() {
         inputs.push(extract_input(psbt, input_idx)?);
     }
 
     // Extract outputs
     let mut outputs = Vec::new();
-    for output_idx in 0..psbt.num_outputs() {
+    for output_idx in 0..psbt.outputs.len() {
         outputs.push(extract_output(psbt, output_idx)?);
     }
 
-    let tx = Transaction {
+    Ok(Transaction {
         version,
         lock_time,
         input: inputs,
         output: outputs,
-    };
-
-    // Clean up SP tweaks after successful extraction
-    // This prevents accidental re-use of tweaks and keeps PSBTs cleaner
-    for input_idx in 0..psbt.num_inputs() {
-        if psbt.get_input_sp_tweak(input_idx).is_some() {
-            psbt.remove_input_sp_tweak(input_idx)?;
-        }
-    }
-
-    Ok(tx)
+    })
 }
 
 /// Extract a single input from the PSBT
@@ -77,55 +61,32 @@ fn extract_input(psbt: &SilentPaymentPsbt, input_idx: usize) -> Result<TxIn> {
     })
 }
 
-/// Extract witness data from input
+/// Extract witness data from a finalized input.
 ///
-/// Handles both P2WPKH and P2TR witness formats:
-/// - **P2TR** (Taproot key path): Check for `tap_key_sig` first
-///   - Witness: `[<bip340_signature>]` (single element, 65 bytes)
-/// - **P2WPKH**: Fall back to `partial_sigs`
-///   - Witness: `[<ecdsa_signature>, <pubkey>]` (two elements)
+/// Reads `PSBT_IN_FINAL_SCRIPTWITNESS` (set by `finalize_input_witnesses`).
+/// Returns an error if the input has not been finalized.
 fn extract_witness(psbt: &SilentPaymentPsbt, input_idx: usize) -> Result<Witness> {
     let input = psbt
         .inputs
         .get(input_idx)
         .ok_or(Error::InvalidInputIndex(input_idx))?;
 
-    // Check for P2TR tap_key_sig first (Taproot key-path spend)
-    if let Some(tap_sig) = &input.tap_key_sig {
-        // P2TR witness has single element: BIP-340 Schnorr signature
-        let mut witness = Witness::new();
-        witness.push(tap_sig.to_vec());
-        return Ok(witness);
+    if let Some(witness) = &input.final_script_witness {
+        return Ok(witness.clone());
     }
 
-    // Fall back to P2WPKH partial_sigs (ECDSA)
-    let sigs = psbt.get_input_partial_sigs(input_idx);
-
-    if sigs.is_empty() {
-        return Err(Error::ExtractionFailed(format!(
-            "Input {} has no signatures (neither tap_key_sig nor partial_sigs)",
-            input_idx
-        )));
+    // Legacy P2SH path (non-segwit): PSBT_IN_FINAL_SCRIPTSIG
+    // final_script_sig is a ScriptBuf; for non-segwit we'd put it in script_sig
+    // and leave witness empty. Not currently used in this codebase but handled
+    // for completeness.
+    if input.final_script_sig.is_some() {
+        return Ok(Witness::new()); // script_sig carried in TxIn, witness is empty
     }
 
-    // For P2WPKH, witness is: <signature> <pubkey>
-    // We expect exactly one signature for single-key P2WPKH
-    if sigs.len() != 1 {
-        return Err(Error::ExtractionFailed(format!(
-            "Input {} has {} partial signatures, expected 1 for P2WPKH",
-            input_idx,
-            sigs.len()
-        )));
-    }
-
-    let (pubkey, signature) = &sigs[0];
-
-    // Build P2WPKH witness stack
-    let mut witness = Witness::new();
-    witness.push(signature);
-    witness.push(pubkey);
-
-    Ok(witness)
+    Err(Error::ExtractionFailed(format!(
+        "Input {} is not finalized — call finalize_input_witnesses before extraction",
+        input_idx
+    )))
 }
 
 /// Extract a single output from the PSBT
@@ -149,7 +110,8 @@ mod tests {
     use crate::psbt::roles::{
         constructor::{add_inputs, add_outputs},
         creator::create_psbt,
-        input_finalizer::finalize_inputs,
+        input_finalizer::finalize_sp_outputs,
+        input_witness_finalizer::finalize_input_witnesses,
         signer::{add_ecdh_shares_full, sign_inputs},
     };
     use bitcoin::{hashes::Hash, Amount, OutPoint, ScriptBuf, Sequence, TxOut, Txid};
@@ -207,8 +169,11 @@ mod tests {
         // Sign inputs
         sign_inputs(&secp, &mut psbt, &inputs).unwrap();
 
+        // Finalize input witnesses (BIP-174 Finalizer role)
+        finalize_input_witnesses(&mut psbt).unwrap();
+
         // Extract transaction
-        let tx = extract_transaction(&mut psbt).unwrap();
+        let tx = extract_transaction(&psbt).unwrap();
 
         // Verify transaction structure
         assert_eq!(tx.input.len(), 2);
@@ -276,14 +241,17 @@ mod tests {
         // Add ECDH shares
         add_ecdh_shares_full(&secp, &mut psbt, &inputs, &[scan_key], false).unwrap();
 
-        // Finalize inputs (compute output scripts)
-        finalize_inputs(&secp, &mut psbt).unwrap();
+        // Finalize SP output scripts
+        finalize_sp_outputs(&secp, &mut psbt).unwrap();
 
         // Sign inputs
         sign_inputs(&secp, &mut psbt, &inputs).unwrap();
 
+        // Finalize input witnesses (BIP-174 Finalizer role)
+        finalize_input_witnesses(&mut psbt).unwrap();
+
         // Extract transaction
-        let tx = extract_transaction(&mut psbt).unwrap();
+        let tx = extract_transaction(&psbt).unwrap();
 
         // Verify transaction structure
         assert_eq!(tx.input.len(), 2);
@@ -320,8 +288,8 @@ mod tests {
         add_inputs(&mut psbt, &inputs).unwrap();
         add_outputs(&mut psbt, &outputs).unwrap();
 
-        // Extraction should fail without signatures
-        let result = extract_transaction(&mut psbt);
+        // Extraction should fail when finalize_input_witnesses has not been called
+        let result = extract_transaction(&psbt);
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::ExtractionFailed(_))));
     }

@@ -1,6 +1,8 @@
-//! PSBT Input Finalizer Role
+//! Silent Payment Output Script Derivation
 //!
-//! Aggregates ECDH shares and computes final output scripts for silent payments.
+//! Aggregates ECDH shares and computes final output scripts for silent payments
+//! (BIP-352 output derivation). This is distinct from the BIP-174 input witness
+//! finalizer — see `input_witness_finalizer.rs` for that role.
 
 use crate::psbt::core::{
     aggregate_ecdh_shares, get_input_bip32_pubkeys, get_input_outpoint_bytes, Bip375PsbtExt,
@@ -12,12 +14,15 @@ use crate::psbt::crypto::{
 use secp256k1::{PublicKey, Secp256k1};
 use std::collections::HashMap;
 
-/// Finalize inputs by computing output scripts from ECDH shares.
+/// Compute silent payment output scripts from aggregated ECDH shares (BIP-352).
 ///
 /// Per BIP 352, the shared secret for output derivation is:
 ///   shared_secret = input_hash * aggregated_ecdh_share
 /// where input_hash = hash_BIP0352/Inputs(smallest_outpoint || sum_of_pubkeys)
-pub fn finalize_inputs(
+///
+/// Note: this derives output *scripts* and is not the BIP-174 input witness
+/// finalizer. See `finalize_input_witnesses` for that role.
+pub fn finalize_sp_outputs(
     secp: &Secp256k1<secp256k1::All>,
     psbt: &mut SilentPaymentPsbt,
 ) -> Result<()> {
@@ -112,7 +117,7 @@ mod tests {
     use silentpayments::{Network as SpNetwork, SilentPaymentAddress};
 
     #[test]
-    fn test_finalize_inputs_basic() {
+    fn test_finalize_sp_outputs_basic() {
         let secp = Secp256k1::new();
 
         // Create PSBT with 2 inputs and 1 silent payment output
@@ -170,7 +175,7 @@ mod tests {
         add_ecdh_shares_full(&secp, &mut psbt, &inputs, &[scan_key], false).unwrap();
 
         // Finalize inputs (compute output scripts)
-        finalize_inputs(&secp, &mut psbt).unwrap();
+        finalize_sp_outputs(&secp, &mut psbt).unwrap();
 
         // Verify output script was added
         let script = &psbt.outputs[0].script_pubkey;
@@ -222,7 +227,7 @@ mod tests {
         add_ecdh_shares_partial(&secp, &mut psbt, &inputs, &[scan_key], &[0], false).unwrap();
 
         // Finalize should fail due to incomplete coverage
-        let result = finalize_inputs(&secp, &mut psbt);
+        let result = finalize_sp_outputs(&secp, &mut psbt);
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::IncompleteEcdhCoverage(0))));
     }
@@ -286,7 +291,7 @@ mod tests {
         add_ecdh_shares_full(&secp, &mut psbt, &inputs, &[scan_key], false).unwrap();
 
         // Finalize inputs (compute output scripts)
-        finalize_inputs(&secp, &mut psbt).unwrap();
+        finalize_sp_outputs(&secp, &mut psbt).unwrap();
 
         // Verify tx_modifiable_flags is cleared after finalization
         assert_eq!(
