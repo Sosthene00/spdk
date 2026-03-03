@@ -8,10 +8,7 @@
 //! - ECDH share types
 //! - UTXO types
 
-pub mod error;
 pub mod extensions;
-pub mod shares;
-pub mod types;
 
 pub use error::{Error, Result};
 pub use extensions::{
