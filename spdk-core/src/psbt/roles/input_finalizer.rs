@@ -8,6 +8,10 @@ use crate::psbt::core::{
     aggregate_ecdh_shares, compute_sp_shared_secrets, Bip375PsbtExt, Error, Result,
     SilentPaymentPsbt,
 };
+use crate::psbt::crypto::bip352::is_input_eligible;
+use crate::psbt::crypto::{
+    compute_shared_secrets, derive_silent_payment_output_pubkey, tweaked_key_to_p2tr_script,
+};
 use crate::psbt::crypto::{derive_silent_payment_output_pubkey, tweaked_key_to_p2tr_script};
 use secp256k1::{PublicKey, Secp256k1};
 use std::collections::HashMap;
@@ -41,7 +45,28 @@ pub fn finalize_sp_outputs(
         }
     }
 
-    let shared_secrets = compute_sp_shared_secrets(secp, psbt, &aggregated_shares)?;
+    // Extract outpoints and BIP32 pubkeys from PSBT
+    let mut outpoints: Vec<Vec<u8>> = Vec::new();
+    let mut input_pubkeys: Vec<PublicKey> = Vec::new();
+    for input_idx in 0..psbt.num_inputs() {
+        let input = &psbt.inputs[input_idx];
+        if !is_input_eligible(input) {
+            continue;
+        }
+        outpoints.push(get_input_outpoint_bytes(psbt, input_idx)?);
+        if let Ok(pubkey) = get_input_pubkey(psbt, input_idx) {
+            input_pubkeys.push(pubkey);
+        }
+    }
+
+    // Build (scan_key, aggregated_share) pairs for BIP-352 computation
+    let share_pairs: Vec<(PublicKey, PublicKey)> = aggregated_shares
+        .iter()
+        .map(|(sk, agg)| (*sk, agg.aggregated_share))
+        .collect();
+
+    let shared_secrets = compute_shared_secrets(secp, &share_pairs, &outpoints, &input_pubkeys)
+        .map_err(|e| Error::Other(format!("Shared secret computation failed: {}", e)))?;
 
     // Track output index per scan key (for BIP 352 k parameter)
     let mut scan_key_output_indices: HashMap<PublicKey, u32> = HashMap::new();

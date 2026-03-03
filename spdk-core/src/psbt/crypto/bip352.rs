@@ -10,6 +10,137 @@ use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
 use silentpayments::bitcoin_hashes::Hash as SpHash;
 use silentpayments::utils::hash::SharedSecretHash;
 use silentpayments::utils::NUMS_H;
+use std::collections::HashMap;
+
+/// Compute label tweak for a silent payment address
+///
+/// BIP 352: hash_BIP0352/Label(ser₂₅₆(scan_privkey) || ser₃₂(label))
+/// Uses tagged hash as per BIP 340
+pub fn compute_label_tweak(scan_privkey: &SecretKey, label: u32) -> Result<Scalar> {
+    // BIP 352 tagged hash: tag_hash || tag_hash || data
+    let tag = b"BIP0352/Label";
+    let tag_hash = sha256::Hash::hash(tag);
+
+    let mut engine = sha256::Hash::engine();
+    engine.input(tag_hash.as_ref());
+    engine.input(tag_hash.as_ref());
+    engine.input(&scan_privkey.secret_bytes());
+    engine.input(&label.to_le_bytes());
+    let hash = sha256::Hash::from_engine(engine);
+
+    Scalar::from_be_bytes(hash.to_byte_array())
+        .map_err(|_| CryptoError::Other("Failed to create scalar from label tweak".to_string()))
+}
+
+/// Compute input hash for BIP-352 silent payments
+///
+/// BIP 352: hash_BIP0352/Inputs(smallest_outpoint || ser₃₃(A))
+/// where A is the sum of all eligible input public keys
+/// Uses tagged hash as per BIP 340
+pub fn compute_input_hash(smallest_outpoint: &[u8], summed_pubkey: &PublicKey) -> Result<Scalar> {
+    // BIP 352 tagged hash: tag_hash || tag_hash || data
+    let tag = b"BIP0352/Inputs";
+    let tag_hash = sha256::Hash::hash(tag);
+
+    let mut engine = sha256::Hash::engine();
+    engine.input(tag_hash.as_ref());
+    engine.input(tag_hash.as_ref());
+    engine.input(smallest_outpoint);
+    engine.input(&summed_pubkey.serialize());
+    let hash = sha256::Hash::from_engine(engine);
+
+    Scalar::from_be_bytes(hash.to_byte_array())
+        .map_err(|_| CryptoError::Other("Failed to create scalar from input hash".to_string()))
+}
+
+/// Compute BIP-352 shared secrets from aggregated ECDH shares.
+///
+/// For each scan key, computes: shared_secret = input_hash * aggregated_share
+/// where input_hash = hash_BIP0352/Inputs(smallest_outpoint || sum_of_pubkeys)
+///
+/// If `input_pubkeys` is empty or doesn't cover all outpoints, falls back to
+/// returning raw aggregated shares (for backwards compatibility with tests
+/// that don't set BIP32 derivations).
+pub fn compute_shared_secrets(
+    secp: &Secp256k1<secp256k1::All>,
+    aggregated_shares: &[(PublicKey, PublicKey)], // (scan_key, aggregated_share)
+    outpoints: &[Vec<u8>],
+    input_pubkeys: &[PublicKey],
+) -> Result<HashMap<PublicKey, PublicKey>> {
+    let input_hash = if !input_pubkeys.is_empty() {
+        let mut summed_pubkey = input_pubkeys[0];
+        for pubkey in &input_pubkeys[1..] {
+            summed_pubkey = summed_pubkey
+                .combine(pubkey)
+                .map_err(|e| CryptoError::Other(format!("Failed to sum input pubkeys: {}", e)))?;
+        }
+
+        let smallest_outpoint = outpoints
+            .iter()
+            .min()
+            .ok_or_else(|| CryptoError::Other("No outpoints provided".to_string()))?;
+
+        Some(compute_input_hash(smallest_outpoint, &summed_pubkey)?)
+    } else {
+        None
+    };
+
+    let mut shared_secrets = HashMap::new();
+    for (scan_key, aggregated_share) in aggregated_shares {
+        let shared_secret = if let Some(ref ih) = input_hash {
+            aggregated_share.mul_tweak(secp, ih).map_err(|e| {
+                CryptoError::Other(format!(
+                    "Failed to multiply ECDH share by input_hash: {}",
+                    e
+                ))
+            })?
+        } else {
+            *aggregated_share
+        };
+        shared_secrets.insert(*scan_key, shared_secret);
+    }
+
+    Ok(shared_secrets)
+}
+
+/// Compute shared secret tweak for output derivation
+///
+/// BIP 352: hash_BIP0352/SharedSecret(ecdh_secret || ser₃₂(k))
+/// Uses tagged hash as per BIP 340
+pub fn compute_shared_secret_tweak(ecdh_secret: &[u8; 33], k: u32) -> Result<Scalar> {
+    // BIP 352 tagged hash: tag_hash || tag_hash || data
+    let tag = b"BIP0352/SharedSecret";
+    let tag_hash = sha256::Hash::hash(tag);
+
+    let mut engine = sha256::Hash::engine();
+    engine.input(tag_hash.as_ref());
+    engine.input(tag_hash.as_ref());
+    engine.input(ecdh_secret);
+    engine.input(&k.to_be_bytes());
+    let hash = sha256::Hash::from_engine(engine);
+
+    Scalar::from_be_bytes(hash.to_byte_array()).map_err(|_| {
+        CryptoError::Other("Failed to create scalar from shared secret tweak".to_string())
+    })
+}
+
+/// Apply label to spend public key
+///
+/// labeled_spend_key = spend_key + label_tweak * G
+pub fn apply_label_to_spend_key(
+    secp: &Secp256k1<secp256k1::All>,
+    spend_key: &PublicKey,
+    scan_privkey: &SecretKey,
+    label: u32,
+) -> Result<PublicKey> {
+    let label_tweak = compute_label_tweak(scan_privkey, label)?;
+    let label_tweak_key = SecretKey::from_slice(&label_tweak.to_be_bytes())?;
+    let label_point = PublicKey::from_secret_key(secp, &label_tweak_key);
+
+    spend_key
+        .combine(&label_point)
+        .map_err(|e| CryptoError::Other(format!("Failed to apply label: {}", e)))
+}
 
 /// Derive silent payment output public key
 ///
@@ -102,6 +233,11 @@ pub fn is_input_eligible(input: &Input) -> bool {
 
     // P2TR (Taproot, SegWit v1) - eligible unless internal key is NUMS point (BIP-352)
     if script.is_p2tr() {
+        const NUMS_POINT: [u8; 32] = [
+            0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
+            0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
+            0xce, 0x80, 0x3a, 0xc0,
+        ];
         if let Some(internal_key) = &input.tap_internal_key {
             if internal_key.serialize() == NUMS_H {
                 return false;
