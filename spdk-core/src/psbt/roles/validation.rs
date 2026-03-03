@@ -2,11 +2,17 @@
 //!
 //! Validates PSBTs according to BIP-375 rules.
 
-use crate::psbt::core::{Bip375PsbtExt, Error, Result, SilentPaymentPsbt};
+use crate::psbt::core::{
+    aggregate_ecdh_shares, get_input_outpoint_bytes, get_input_pubkey, Bip375PsbtExt, Error,
+    Result, SilentPaymentPsbt,
+};
 use crate::psbt::crypto::bip352::is_input_eligible;
-use crate::psbt::crypto::dleq_verify_proof;
+use crate::psbt::crypto::{
+    compute_shared_secrets, derive_silent_payment_output_pubkey, dleq_verify_proof,
+    tweaked_key_to_p2tr_script,
+};
 use secp256k1::{PublicKey, Secp256k1};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Validation level for PSBT checks
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,9 +87,7 @@ fn validate_psbt_version(psbt: &SilentPaymentPsbt) -> Result<()> {
 fn validate_psbt_state(psbt: &SilentPaymentPsbt) -> Result<()> {
     for (i, output) in psbt.outputs.iter().enumerate() {
         let is_sp_output = psbt.get_output_sp_info(i).is_some();
-        if is_sp_output
-            && !output.script_pubkey.is_empty()
-            && psbt.global.tx_modifiable_flags != 0
+        if is_sp_output && !output.script_pubkey.is_empty() && psbt.global.tx_modifiable_flags != 0
         {
             return Err(Error::InvalidPsbtState(
                 "SP output has script_pubkey set while tx_modifiable_flags is non-zero".to_string(),
@@ -146,7 +150,10 @@ fn validate_sp_spend_fields(psbt: &SilentPaymentPsbt) -> Result<()> {
     for input_idx in 0..psbt.num_inputs() {
         // Check if this input has an SP tweak
         if psbt.get_input_sp_tweak(input_idx).is_some() {
-            if psbt.get_input_sp_spend_bip32_derivation(input_idx).is_none() {
+            if psbt
+                .get_input_sp_spend_bip32_derivation(input_idx)
+                .is_none()
+            {
                 return Err(Error::MissingField(format!(
                     "Input {} has SP tweak but missing SP spend BIP32 derivation",
                     input_idx
@@ -283,29 +290,26 @@ fn validate_output_scripts(
     secp: &Secp256k1<secp256k1::All>,
     psbt: &SilentPaymentPsbt,
 ) -> Result<()> {
-    use crate::psbt::core::{
-        aggregate_ecdh_shares, get_input_bip32_pubkeys, get_input_outpoint_bytes,
-    };
-    use crate::psbt::crypto::{
-        compute_shared_secrets, derive_silent_payment_output_pubkey, tweaked_key_to_p2tr_script,
-    };
-    use std::collections::HashMap;
-
     // Extract outpoints and BIP32 pubkeys from PSBT
     let mut outpoints: Vec<Vec<u8>> = Vec::new();
     let mut input_pubkeys: Vec<PublicKey> = Vec::new();
 
     for input_idx in 0..psbt.num_inputs() {
-        outpoints.push(get_input_outpoint_bytes(psbt, input_idx)?);
-        let bip32_pubkeys = get_input_bip32_pubkeys(psbt, input_idx);
-        if bip32_pubkeys.is_empty() {
-            eprintln!(
-                "Warning: Input {} has no BIP32 derivation, skipping output script validation",
-                input_idx
-            );
-            return Ok(());
+        let input = &psbt.inputs[input_idx];
+        if !is_input_eligible(input) {
+            continue;
         }
-        input_pubkeys.push(bip32_pubkeys[0]);
+        outpoints.push(get_input_outpoint_bytes(psbt, input_idx)?);
+        match get_input_pubkey(psbt, input_idx) {
+            Ok(pubkey) => input_pubkeys.push(pubkey),
+            Err(_) => {
+                eprintln!(
+                    "Warning: Eligible input {} has no public key, skipping output script validation",
+                    input_idx
+                );
+                return Ok(());
+            }
+        }
     }
 
     if input_pubkeys.is_empty() {
@@ -319,9 +323,8 @@ fn validate_output_scripts(
         .map(|(sk, agg)| (*sk, agg.aggregated_share))
         .collect();
 
-    let shared_secrets =
-        compute_shared_secrets(secp, &share_pairs, &outpoints, &input_pubkeys)
-            .map_err(|e| Error::Other(format!("Shared secret computation failed: {}", e)))?;
+    let shared_secrets = compute_shared_secrets(secp, &share_pairs, &outpoints, &input_pubkeys)
+        .map_err(|e| Error::Other(format!("Shared secret computation failed: {}", e)))?;
 
     let mut scan_key_output_indices: HashMap<PublicKey, u32> = HashMap::new();
 
@@ -367,8 +370,6 @@ fn validate_output_scripts(
 
 /// Validate all DLEQ proofs in the PSBT
 fn validate_dleq_proofs(secp: &Secp256k1<secp256k1::All>, psbt: &SilentPaymentPsbt) -> Result<()> {
-    use crate::psbt::core::get_input_pubkey;
-
     // Check global DLEQ if global ECDH exists
     let global_shares = psbt.get_global_ecdh_shares();
     for share in global_shares {
@@ -457,8 +458,7 @@ pub fn validate_ready_for_extraction(psbt: &SilentPaymentPsbt) -> Result<()> {
     for input_idx in 0..psbt.num_inputs() {
         let input = &psbt.inputs[input_idx];
 
-        let is_finalized =
-            input.final_script_witness.is_some() || input.final_script_sig.is_some();
+        let is_finalized = input.final_script_witness.is_some() || input.final_script_sig.is_some();
 
         if !is_finalized {
             return Err(Error::ExtractionFailed(format!(
@@ -628,6 +628,5 @@ mod tests {
 
             assert!(validate_ecdh_coverage(&psbt_partial).is_ok());
         }
-
     }
 }

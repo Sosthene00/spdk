@@ -65,24 +65,23 @@ pub fn compute_shared_secrets(
     outpoints: &[Vec<u8>],
     input_pubkeys: &[PublicKey],
 ) -> Result<HashMap<PublicKey, PublicKey>> {
-    let input_hash =
-        if !input_pubkeys.is_empty() && input_pubkeys.len() == outpoints.len() {
-            let mut summed_pubkey = input_pubkeys[0];
-            for pubkey in &input_pubkeys[1..] {
-                summed_pubkey = summed_pubkey.combine(pubkey).map_err(|e| {
-                    CryptoError::Other(format!("Failed to sum input pubkeys: {}", e))
-                })?;
-            }
+    let input_hash = if !input_pubkeys.is_empty() {
+        let mut summed_pubkey = input_pubkeys[0];
+        for pubkey in &input_pubkeys[1..] {
+            summed_pubkey = summed_pubkey
+                .combine(pubkey)
+                .map_err(|e| CryptoError::Other(format!("Failed to sum input pubkeys: {}", e)))?;
+        }
 
-            let smallest_outpoint = outpoints
-                .iter()
-                .min()
-                .ok_or_else(|| CryptoError::Other("No outpoints provided".to_string()))?;
+        let smallest_outpoint = outpoints
+            .iter()
+            .min()
+            .ok_or_else(|| CryptoError::Other("No outpoints provided".to_string()))?;
 
-            Some(compute_input_hash(smallest_outpoint, &summed_pubkey)?)
-        } else {
-            None
-        };
+        Some(compute_input_hash(smallest_outpoint, &summed_pubkey)?)
+    } else {
+        None
+    };
 
     let mut shared_secrets = HashMap::new();
     for (scan_key, aggregated_share) in aggregated_shares {
@@ -245,10 +244,9 @@ pub fn is_input_eligible(input: &Input) -> bool {
     // P2TR (Taproot, SegWit v1) - eligible unless internal key is NUMS point (BIP-352)
     if script.is_p2tr() {
         const NUMS_POINT: [u8; 32] = [
-            0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54,
-            0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
-            0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5,
-            0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
+            0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
+            0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
+            0xce, 0x80, 0x3a, 0xc0,
         ];
         if let Some(internal_key) = &input.tap_internal_key {
             if internal_key.serialize() == NUMS_POINT {

@@ -5,9 +5,10 @@
 //! finalizer — see `input_witness_finalizer.rs` for that role.
 
 use crate::psbt::core::{
-    aggregate_ecdh_shares, get_input_bip32_pubkeys, get_input_outpoint_bytes, Bip375PsbtExt,
-    Error, Result, SilentPaymentPsbt,
+    aggregate_ecdh_shares, get_input_outpoint_bytes, get_input_pubkey, Bip375PsbtExt, Error,
+    Result, SilentPaymentPsbt,
 };
+use crate::psbt::crypto::bip352::is_input_eligible;
 use crate::psbt::crypto::{
     compute_shared_secrets, derive_silent_payment_output_pubkey, tweaked_key_to_p2tr_script,
 };
@@ -47,10 +48,13 @@ pub fn finalize_sp_outputs(
     let mut outpoints: Vec<Vec<u8>> = Vec::new();
     let mut input_pubkeys: Vec<PublicKey> = Vec::new();
     for input_idx in 0..psbt.num_inputs() {
+        let input = &psbt.inputs[input_idx];
         outpoints.push(get_input_outpoint_bytes(psbt, input_idx)?);
-        let bip32_pubkeys = get_input_bip32_pubkeys(psbt, input_idx);
-        if !bip32_pubkeys.is_empty() {
-            input_pubkeys.push(bip32_pubkeys[0]);
+        if !is_input_eligible(input) {
+            continue;
+        }
+        if let Ok(pubkey) = get_input_pubkey(psbt, input_idx) {
+            input_pubkeys.push(pubkey);
         }
     }
 
@@ -83,13 +87,9 @@ pub fn finalize_sp_outputs(
 
         // Derive the output public key using BIP-352
         let shared_secret_bytes = shared_secret.serialize();
-        let output_pubkey = derive_silent_payment_output_pubkey(
-            secp,
-            &spend_key,
-            &shared_secret_bytes,
-            k,
-        )
-        .map_err(|e| Error::Other(format!("Output derivation failed: {}", e)))?;
+        let output_pubkey =
+            derive_silent_payment_output_pubkey(secp, &spend_key, &shared_secret_bytes, k)
+                .map_err(|e| Error::Other(format!("Output derivation failed: {}", e)))?;
 
         let output_script = tweaked_key_to_p2tr_script(&output_pubkey);
 
