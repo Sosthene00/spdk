@@ -620,20 +620,6 @@ pub fn get_input_outpoint(psbt: &SilentPaymentPsbt, input_idx: usize) -> Result<
     Ok(OutPoint { txid, vout })
 }
 
-/// Get all BIP32 derivation public keys for an input
-pub fn get_input_bip32_pubkeys(psbt: &SilentPaymentPsbt, input_idx: usize) -> Vec<PublicKey> {
-    let mut pubkeys = Vec::new();
-
-    if let Some(input) = psbt.inputs.get(input_idx) {
-        for key in input.bip32_derivations.keys() {
-            // key is bitcoin::PublicKey, inner is secp256k1::PublicKey
-            pubkeys.push(*key);
-        }
-    }
-
-    pubkeys
-}
-
 /// Get input public key from PSBT fields with fallback priority
 ///
 /// Tries multiple sources in this order:
@@ -673,7 +659,7 @@ pub fn get_input_pubkey(psbt: &SilentPaymentPsbt, input_idx: usize) -> Result<Pu
     }
 
     Err(Error::Other(format!(
-        "Input {} missing public key (no SP spend, BIP32 derivation, or tap key origin found)",
+        "Input {} missing public key (no SP spend, tap internal key or BIP32 derivations found)",
         input_idx
     )))
 }

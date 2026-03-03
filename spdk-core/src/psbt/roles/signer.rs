@@ -181,13 +181,10 @@ fn sign_p2tr_with_optional_tweak(
         .iter()
         .enumerate()
         .map(|(idx, input)| {
-            input
-                .witness_utxo
-                .clone()
-                .ok_or(Error::Other(format!(
-                    "Input {} missing witness_utxo (required for P2TR)",
-                    idx
-                )))
+            input.witness_utxo.clone().ok_or(Error::Other(format!(
+                "Input {} missing witness_utxo (required for P2TR)",
+                idx
+            )))
         })
         .collect::<Result<Vec<_>>>()?;
 
