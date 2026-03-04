@@ -218,9 +218,14 @@ pub fn compute_sp_shared_secrets(
     psbt: &SilentPaymentPsbt,
     aggregated_shares: &AggregatedShares,
 ) -> Result<HashMap<PublicKey, PublicKey>> {
-    let outpoints = (0..psbt.num_inputs())
-        .map(|input_idx| get_input_outpoint_bytes(psbt, input_idx))
-        .collect::<Result<Vec<_>>>()?;
+    let mut outpoints: Vec<Vec<u8>> = Vec::new();
+    for input_idx in 0..psbt.num_inputs() {
+        let input = &psbt.inputs[input_idx];
+        if !is_input_eligible(input) {
+            continue;
+        }
+        outpoints.push(get_input_outpoint_bytes(psbt, input_idx)?);
+    }
 
     let smallest_outpoint = outpoints
         .iter()
@@ -296,6 +301,14 @@ pub fn compute_sp_shared_secrets(
                             e
                         ))
                     })?
+                // let input_hash = compute_input_hash(smallest_outpoint, &summed_pubkey)
+                //     .map_err(|e| Error::Other(format!("Failed to compute input_hash: {}", e)))?;
+                // agg.aggregated_share.mul_tweak(secp, &input_hash).map_err(|e| {
+                //     Error::Other(format!(
+                //         "Failed to multiply ECDH share by input_hash: {}",
+                //         e
+                //     ))
+                // })?
             }
             // No pubkeys available: use raw aggregated share (fallback for test contexts
             // where inputs have no BIP32 derivation data)
