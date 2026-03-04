@@ -7,10 +7,7 @@ use crate::psbt::core::{
     Result, SilentPaymentPsbt,
 };
 use crate::psbt::crypto::bip352::is_input_eligible;
-use crate::psbt::crypto::{
-    compute_shared_secrets, derive_silent_payment_output_pubkey, dleq_verify_proof,
-    tweaked_key_to_p2tr_script,
-};
+use crate::psbt::crypto::{derive_silent_payment_output_pubkey, dleq_verify_proof, tweaked_key_to_p2tr_script};
 use secp256k1::{PublicKey, Secp256k1};
 use std::collections::{HashMap, HashSet};
 
@@ -289,41 +286,12 @@ fn validate_output_scripts(
     secp: &Secp256k1<secp256k1::All>,
     psbt: &SilentPaymentPsbt,
 ) -> Result<()> {
-    // Extract outpoints and BIP32 pubkeys from PSBT
-    let mut outpoints: Vec<Vec<u8>> = Vec::new();
-    let mut input_pubkeys: Vec<PublicKey> = Vec::new();
+    let aggregated_shares = aggregate_ecdh_shares(psbt)?;
+    let shared_secrets = compute_sp_shared_secrets(secp, psbt, &aggregated_shares)?;
 
-    for input_idx in 0..psbt.num_inputs() {
-        let input = &psbt.inputs[input_idx];
-        if !is_input_eligible(input) {
-            continue;
-        }
-        outpoints.push(get_input_outpoint_bytes(psbt, input_idx)?);
-        match get_input_pubkey(psbt, input_idx) {
-            Ok(pubkey) => input_pubkeys.push(pubkey),
-            Err(_) => {
-                eprintln!(
-                    "Warning: Eligible input {} has no public key, skipping output script validation",
-                    input_idx
-                );
-                return Ok(());
-            }
-        }
-    }
-
-    if input_pubkeys.is_empty() {
+    if shared_secrets.is_empty() {
         return Ok(());
     }
-
-    let aggregated_shares = aggregate_ecdh_shares(psbt)?;
-
-    let share_pairs: Vec<(PublicKey, PublicKey)> = aggregated_shares
-        .iter()
-        .map(|(sk, agg)| (*sk, agg.aggregated_share))
-        .collect();
-
-    let shared_secrets = compute_shared_secrets(secp, &share_pairs, &outpoints, &input_pubkeys)
-        .map_err(|e| Error::Other(format!("Shared secret computation failed: {}", e)))?;
 
     let mut scan_key_output_indices: HashMap<PublicKey, u32> = HashMap::new();
 
