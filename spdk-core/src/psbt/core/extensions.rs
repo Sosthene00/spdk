@@ -624,9 +624,8 @@ pub fn get_input_outpoint(psbt: &SilentPaymentPsbt, input_idx: usize) -> Result<
 ///
 /// Tries multiple sources in this order:
 /// 1. SP spend BIP32 derivation (for Silent Payment inputs, highest priority)
-/// 2. Taproot BIP32 derivation (tap_internal_key for P2TR)
-/// 3. Standard BIP32 derivation field (for non-Taproot)
-/// 4. Partial signature field
+/// 2. Standard BIP32 derivation field (for non-Taproot)
+/// 3. Witness utxo (for Taproot)
 pub fn get_input_pubkey(psbt: &SilentPaymentPsbt, input_idx: usize) -> Result<PublicKey> {
     let input = psbt
         .inputs
@@ -638,19 +637,7 @@ pub fn get_input_pubkey(psbt: &SilentPaymentPsbt, input_idx: usize) -> Result<Pu
         return Ok(spend_pubkey);
     }
 
-    // Method 2: Extract from Taproot BIP32 derivation (tap_internal_key for P2TR)
-    if !input.tap_internal_key.is_none() {
-        // Return the first key, converting x-only to full pubkey (even Y)
-        if let Some(xonly_key) = input.tap_internal_key {
-            let mut pubkey_bytes = vec![0x02];
-            pubkey_bytes.extend_from_slice(&xonly_key.serialize());
-            if let Ok(pubkey) = PublicKey::from_slice(&pubkey_bytes) {
-                return Ok(pubkey);
-            }
-        }
-    }
-
-    // Method 3: Extract from BIP32 derivation field (for non-Taproot)
+    // Method 2: Extract from BIP32 derivation field (for non-Taproot)
     if !input.bip32_derivations.is_empty() {
         // Return the first key
         if let Some(key) = input.bip32_derivations.keys().next() {
@@ -658,8 +645,20 @@ pub fn get_input_pubkey(psbt: &SilentPaymentPsbt, input_idx: usize) -> Result<Pu
         }
     }
 
+    // Method 3: Extract from Witness utxo (for Taproot inputs)
+    if let Some(witness_utxo) = input.witness_utxo.as_ref() {
+        if witness_utxo.script_pubkey.is_p2tr()
+        {
+            if let Ok(x_only) = bitcoin::key::XOnlyPublicKey::from_slice(
+                &witness_utxo.script_pubkey.as_bytes()[2..34],
+            ) {
+                return Ok(x_only.public_key(silentpayments::secp256k1::Parity::Even));
+            }
+        }
+    }
+
     Err(Error::Other(format!(
-        "Input {} missing public key (no SP spend, tap internal key or BIP32 derivations found)",
+        "Input {} missing public key (no SP spend, witness utxo or BIP32 derivations found)",
         input_idx
     )))
 }
