@@ -85,7 +85,7 @@ pub fn add_ecdh_shares_partial(
             let dleq_proof = if include_dleq {
                 let rand_aux = [input_idx as u8; 32];
                 Some(
-                    dleq_generate_proof(secp, &base_privkey, scan_key, &rand_aux, None)
+                    dleq_generate_proof(secp, base_privkey, scan_key, &rand_aux, None)
                         .map_err(|e| Error::Other(format!("DLEQ generation failed: {}", e)))?,
                 )
             } else {

@@ -16,9 +16,13 @@
 //!
 //! This module automatically detects which mode is being used and aggregates accordingly.
 
-use super::{get_input_outpoint_bytes, get_input_pubkey, Bip375PsbtExt, Error, Result, SilentPaymentPsbt};
-use crate::psbt::crypto::bip352::{compute_input_hash, is_input_eligible};
+use super::{
+    get_input_outpoint_bytes, get_input_pubkey, Bip375PsbtExt, Error, Result, SilentPaymentPsbt,
+};
+use crate::psbt::crypto::bip352::is_input_eligible;
 use secp256k1::{PublicKey, Secp256k1};
+use silentpayments::bitcoin_hashes::Hash as SpHash;
+use silentpayments::utils::hash::InputsHash;
 use std::collections::HashMap;
 
 /// Result of ECDH share aggregation for a single scan key
@@ -282,14 +286,24 @@ pub fn compute_sp_shared_secrets(
     for (scan_key, agg) in aggregated_shares.iter() {
         let shared_secret = match summed_pubkeys.get(scan_key).and_then(|v| *v) {
             Some(summed_pubkey) => {
-                let input_hash = compute_input_hash(smallest_outpoint, &summed_pubkey)
-                    .map_err(|e| Error::Other(format!("Failed to compute input_hash: {}", e)))?;
-                agg.aggregated_share.mul_tweak(secp, &input_hash).map_err(|e| {
-                    Error::Other(format!(
-                        "Failed to multiply ECDH share by input_hash: {}",
-                        e
-                    ))
-                })?
+                let outpoint_arr: [u8; 36] = smallest_outpoint
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Other("Outpoint is not 36 bytes".to_string()))?;
+                let hash_bytes = SpHash::to_byte_array(InputsHash::from_outpoint_and_A_sum(
+                    &outpoint_arr,
+                    summed_pubkey,
+                ));
+                let input_hash = secp256k1::Scalar::from_be_bytes(hash_bytes)
+                    .map_err(|_| Error::Other("Input hash is invalid scalar".to_string()))?;
+                agg.aggregated_share
+                    .mul_tweak(secp, &input_hash)
+                    .map_err(|e| {
+                        Error::Other(format!(
+                            "Failed to multiply ECDH share by input_hash: {}",
+                            e
+                        ))
+                    })?
             }
             // No pubkeys available: use raw aggregated share (fallback for test contexts
             // where inputs have no BIP32 derivation data)

@@ -167,6 +167,44 @@ pub fn sign_p2pkh_input(
     Ok(sig_bytes)
 }
 
+/// Sign a Taproot input with BIP-340 Schnorr signature (key path spend)
+///
+/// # Arguments
+/// * `secp` - Secp256k1 context
+/// * `tx` - The transaction being signed
+/// * `input_index` - Index of the input to sign
+/// * `prevouts` - All previous outputs (needed for Taproot sighash)
+/// * `tweaked_privkey` - The private key with tweak already applied
+pub fn sign_p2tr_input(
+    secp: &Secp256k1<secp256k1::All>,
+    tx: &Transaction,
+    input_index: usize,
+    prevouts: &[bitcoin::TxOut],
+    tweaked_privkey: &SecretKey,
+) -> Result<bitcoin::taproot::Signature> {
+    use bitcoin::hashes::Hash;
+    use bitcoin::sighash::{Prevouts, TapSighashType};
+
+    let mut sighash_cache = SighashCache::new(tx);
+
+    let sighash = sighash_cache
+        .taproot_key_spend_signature_hash(
+            input_index,
+            &Prevouts::All(prevouts),
+            TapSighashType::Default,
+        )
+        .map_err(|e| CryptoError::Other(format!("Taproot sighash: {}", e)))?;
+
+    let message = Message::from_digest(sighash.to_byte_array());
+    let keypair = secp256k1::Keypair::from_secret_key(secp, tweaked_privkey);
+    let sig = secp.sign_schnorr_no_aux_rand(&message, &keypair);
+
+    Ok(bitcoin::taproot::Signature {
+        signature: sig,
+        sighash_type: TapSighashType::Default,
+    })
+}
+
 /// Sign a message hash with ECDSA (low-level function)
 ///
 /// This is a lower-level function that signs a raw 32-byte hash.

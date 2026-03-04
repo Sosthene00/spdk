@@ -18,7 +18,9 @@ pub use extensions::{
     get_input_outpoint, get_input_outpoint_bytes, get_input_pubkey, get_input_txid, get_input_vout,
     Bip375PsbtExt, GlobalFieldsExt, InputFieldsExt, OutputFieldsExt,
 };
-pub use shares::{aggregate_ecdh_shares, compute_sp_shared_secrets, AggregatedShare, AggregatedShares};
+pub use shares::{
+    aggregate_ecdh_shares, compute_sp_shared_secrets, AggregatedShare, AggregatedShares,
+};
 pub use types::{EcdhShareData, PsbtInput, PsbtOutput};
 
 /// Type alias for PSBT v2 with BIP-375 extensions

@@ -6,8 +6,10 @@ use crate::psbt::core::{
     aggregate_ecdh_shares, compute_sp_shared_secrets, get_input_pubkey, Bip375PsbtExt, Error,
     Result, SilentPaymentPsbt,
 };
-use crate::psbt::crypto::bip352::is_input_eligible;
-use crate::psbt::crypto::{derive_silent_payment_output_pubkey, dleq_verify_proof, tweaked_key_to_p2tr_script};
+use crate::psbt::crypto::{
+    derive_silent_payment_output_pubkey, dleq_verify_proof, is_input_eligible,
+    tweaked_key_to_p2tr_script,
+};
 use secp256k1::{PublicKey, Secp256k1};
 use std::collections::{HashMap, HashSet};
 
@@ -146,16 +148,15 @@ fn validate_output_fields(psbt: &SilentPaymentPsbt) -> Result<()> {
 fn validate_sp_spend_fields(psbt: &SilentPaymentPsbt) -> Result<()> {
     for input_idx in 0..psbt.num_inputs() {
         // Check if this input has an SP tweak
-        if psbt.get_input_sp_tweak(input_idx).is_some() {
-            if psbt
+        if psbt.get_input_sp_tweak(input_idx).is_some()
+            && psbt
                 .get_input_sp_spend_bip32_derivation(input_idx)
                 .is_none()
-            {
-                return Err(Error::MissingField(format!(
-                    "Input {} has SP tweak but missing SP spend BIP32 derivation",
-                    input_idx
-                )));
-            }
+        {
+            return Err(Error::MissingField(format!(
+                "Input {} has SP tweak but missing SP spend BIP32 derivation",
+                input_idx
+            )));
         }
     }
 
