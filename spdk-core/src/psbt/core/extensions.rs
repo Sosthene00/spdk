@@ -637,7 +637,19 @@ pub fn get_input_pubkey(psbt: &SilentPaymentPsbt, input_idx: usize) -> Result<Pu
         return Ok(spend_pubkey);
     }
 
-    // Method 2: Extract from BIP32 derivation field (for non-Taproot)
+    // Method 2: Extract from Taproot BIP32 derivation (tap_internal_key for P2TR)
+    if input.tap_internal_key.is_some() {
+        // Return the first key, converting x-only to full pubkey (even Y)
+        if let Some(xonly_key) = input.tap_internal_key {
+            let mut pubkey_bytes = vec![0x02];
+            pubkey_bytes.extend_from_slice(&xonly_key.serialize());
+            if let Ok(pubkey) = PublicKey::from_slice(&pubkey_bytes) {
+                return Ok(pubkey);
+            }
+        }
+    }
+
+    // Method 3: Extract from BIP32 derivation field (for non-Taproot)
     if !input.bip32_derivations.is_empty() {
         // Return the first key
         if let Some(key) = input.bip32_derivations.keys().next() {
