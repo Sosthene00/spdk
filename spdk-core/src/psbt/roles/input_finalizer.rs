@@ -8,11 +8,9 @@ use crate::psbt::core::{
     aggregate_ecdh_shares, compute_sp_shared_secrets, Bip375PsbtExt, Error, Result,
     SilentPaymentPsbt,
 };
-use crate::psbt::crypto::bip352::is_input_eligible;
 use crate::psbt::crypto::{
-    compute_shared_secrets, derive_silent_payment_output_pubkey, tweaked_key_to_p2tr_script,
+    derive_silent_payment_output_pubkey, tweaked_key_to_p2tr_script,
 };
-use crate::psbt::crypto::{derive_silent_payment_output_pubkey, tweaked_key_to_p2tr_script};
 use secp256k1::{PublicKey, Secp256k1};
 use std::collections::HashMap;
 

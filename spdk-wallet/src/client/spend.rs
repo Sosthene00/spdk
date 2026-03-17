@@ -5,24 +5,22 @@ use bdk_coin_select::{
     Candidate, ChangePolicy, CoinSelector, DrainWeights, TR_DUST_RELAY_MIN_VALUE, Target,
     TargetFee, TargetOutputs,
 };
-use bitcoin::absolute::LockTime;
-use bitcoin::hashes::Hash;
 use bitcoin::key::TapTweak;
 use bitcoin::script::PushBytesBuf;
-use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
-use bitcoin::sighash::{Prevouts, SighashCache};
-use bitcoin::taproot::Signature;
+use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use bitcoin::transaction::Version;
-use bitcoin::{
-    Amount, Network, OutPoint, ScriptBuf, Sequence, TapLeafHash, Transaction, TxIn, TxOut, Witness,
-};
-use silentpayments::utils as sp_utils;
-use silentpayments::{Network as SpNetwork, SilentPaymentAddress};
+use bitcoin::{Amount, Network, OutPoint, ScriptBuf, Sequence};
+use silentpayments::Network as SpNetwork;
 
 use spdk_core::constants::{DATA_CARRIER_SIZE, NUMS};
+use spdk_core::psbt::core::{Bip375PsbtExt, PsbtInput, PsbtOutput, SilentPaymentPsbt};
+use spdk_core::psbt::roles::{
+    add_ecdh_shares_full, construct_psbt, create_psbt, extract_transaction, finalize_sp_outputs,
+    sign_inputs,
+};
 use spdk_core::updater::DiscoveredOutput;
 
-use super::{FeeRate, Recipient, RecipientAddress, SilentPaymentUnsignedTransaction, SpClient};
+use super::{FeeRate, Recipient, RecipientAddress, SpClient};
 
 impl SpClient {
     // For now it's only suitable for wallet that spends only silent payments outputs that it owns
@@ -32,8 +30,7 @@ impl SpClient {
         mut recipients: Vec<Recipient>,
         fee_rate: FeeRate,
         network: Network,
-    ) -> Result<SilentPaymentUnsignedTransaction> {
-        // used to estimate the size of a taproot output
+    ) -> Result<SilentPaymentPsbt> {
         let placeholder_spk = ScriptBuf::new_p2tr_tweaked(
             bitcoin::XOnlyPublicKey::from_str(NUMS)
                 .expect("NUMS is always valid")
@@ -57,7 +54,7 @@ impl SpClient {
                         .require_network(network)?
                         .script_pubkey();
 
-                    Ok(TxOut {
+                    Ok(bitcoin::TxOut {
                         value,
                         script_pubkey,
                     })
@@ -70,7 +67,7 @@ impl SpClient {
                         )));
                     }
 
-                    Ok(TxOut {
+                    Ok(bitcoin::TxOut {
                         value: recipient.amount,
                         script_pubkey: placeholder_spk.clone(),
                     })
@@ -88,18 +85,15 @@ impl SpClient {
                     } else {
                         let mut op_return = PushBytesBuf::with_capacity(data_len);
                         op_return.extend_from_slice(data)?;
-                        let script_pubkey = ScriptBuf::new_op_return(op_return);
-
-                        Ok(TxOut {
+                        Ok(bitcoin::TxOut {
                             value,
-                            script_pubkey,
+                            script_pubkey: ScriptBuf::new_op_return(op_return),
                         })
                     }
                 }
             })
-            .collect::<Result<Vec<TxOut>>>()?;
+            .collect::<Result<Vec<bitcoin::TxOut>>>()?;
 
-        // as a silent payment wallet, we only spend taproot outputs
         let candidates: Vec<Candidate> = available_utxos
             .iter()
             .map(|(_, o)| Candidate::new_tr_keyspend(o.value.to_sat()))
@@ -107,7 +101,6 @@ impl SpClient {
 
         let mut coin_selector = CoinSelector::new(&candidates);
 
-        // The min may need to be adjusted, 2 or 3x that would be sensible
         let change_policy =
             ChangePolicy::min_value(DrainWeights::TR_KEYSPEND, TR_DUST_RELAY_MIN_VALUE);
 
@@ -122,7 +115,6 @@ impl SpClient {
 
         coin_selector.select_until_target_met(target)?;
 
-        // get the utxos that have been chosen by the coin selector
         let selected_indices = coin_selector.selected_indices();
         let mut selected_utxos = vec![];
         for i in selected_indices {
@@ -130,7 +122,6 @@ impl SpClient {
             selected_utxos.push((*outpoint, output.clone()));
         }
 
-        // if there is change, add a return address to the list of recipients
         let change = coin_selector.drain(target, change_policy);
         let change_value = if change.is_some() { change.value } else { 0 };
         if change_value > 0 {
@@ -139,17 +130,9 @@ impl SpClient {
                 address: RecipientAddress::SpAddress(change_address),
                 amount: Amount::from_sat(change_value),
             });
-        };
+        }
 
-        let partial_secret = self.get_partial_secret_for_selected_utxos(&selected_utxos)?;
-
-        Ok(SilentPaymentUnsignedTransaction {
-            selected_utxos,
-            recipients,
-            partial_secret,
-            unsigned_tx: None,
-            network,
-        })
+        self.build_psbt(&selected_utxos, &recipients, network, address_sp_network)
     }
 
     /// A drain transaction spends all the available utxos to a single RecipientAddress.
@@ -159,8 +142,7 @@ impl SpClient {
         recipient: RecipientAddress,
         fee_rate: FeeRate,
         network: Network,
-    ) -> Result<SilentPaymentUnsignedTransaction> {
-        // used to estimate the size of a taproot output
+    ) -> Result<SilentPaymentPsbt> {
         let placeholder_spk = ScriptBuf::new_p2tr_tweaked(
             bitcoin::XOnlyPublicKey::from_str(NUMS)
                 .expect("NUMS is always valid")
@@ -175,7 +157,7 @@ impl SpClient {
         };
 
         let output = match &recipient {
-            RecipientAddress::LegacyAddress(address) => Ok(TxOut {
+            RecipientAddress::LegacyAddress(address) => Ok(bitcoin::TxOut {
                 value: Amount::ZERO,
                 script_pubkey: address.clone().require_network(network)?.script_pubkey(),
             }),
@@ -187,7 +169,7 @@ impl SpClient {
                     )));
                 }
 
-                Ok(TxOut {
+                Ok(bitcoin::TxOut {
                     value: Amount::ZERO,
                     script_pubkey: placeholder_spk.clone(),
                 })
@@ -195,8 +177,6 @@ impl SpClient {
             RecipientAddress::Data(_) => Err(Error::msg("Draining to OP_RETURN not allowed")),
         }?;
 
-        // for a drain transaction, we have no target outputs.
-        // instead, we register the recipient as the drain output.
         let target_outputs = TargetOutputs {
             value_sum: 0,
             weight_sum: 0,
@@ -209,7 +189,6 @@ impl SpClient {
             n_outputs: 1,
         };
 
-        // as a silent payment wallet, we only spend taproot outputs
         let candidates: Vec<Candidate> = available_utxos
             .iter()
             .map(|(_, o)| Candidate::new_tr_keyspend(o.value.to_sat()))
@@ -217,7 +196,6 @@ impl SpClient {
 
         let mut coin_selector = CoinSelector::new(&candidates);
 
-        // we force a change, by having the min_value be set to 0
         let change_policy = ChangePolicy::min_value(drain_output, 0);
 
         let target = Target {
@@ -225,7 +203,6 @@ impl SpClient {
             outputs: target_outputs,
         };
 
-        // for a drain transaction, we select all avaliable inputs
         coin_selector.select_all();
 
         let change = coin_selector.drain(target, change_policy);
@@ -239,79 +216,59 @@ impl SpClient {
             amount: Amount::from_sat(change.value),
         }];
 
-        let partial_secret = self.get_partial_secret_for_selected_utxos(&available_utxos)?;
-
-        Ok(SilentPaymentUnsignedTransaction {
-            selected_utxos: available_utxos,
-            recipients,
-            partial_secret,
-            unsigned_tx: None,
-            network,
-        })
+        self.build_psbt(&available_utxos, &recipients, network, address_sp_network)
     }
 
-    /// Once we reviewed the temporary transaction state, we can turn it into a transaction
-    pub fn finalize_transaction(
-        mut unsigned_transaction: SilentPaymentUnsignedTransaction,
-    ) -> Result<SilentPaymentUnsignedTransaction> {
-        let tx_ins: Vec<TxIn> = unsigned_transaction
-            .selected_utxos
+    /// Builds a SilentPaymentPsbt from selected UTXOs and recipients.
+    ///
+    /// Constructs inputs/outputs, adds ECDH shares (using each input's tweaked spend key),
+    /// and stores the SP tweak per input so a downstream signer can reconstruct the signing key.
+    fn build_psbt(
+        &self,
+        selected_utxos: &[(OutPoint, DiscoveredOutput)],
+        recipients: &[Recipient],
+        network: Network,
+        address_sp_network: SpNetwork,
+    ) -> Result<SilentPaymentPsbt> {
+        let b_spend = self.try_get_secret_spend_key()?;
+        let secp = Secp256k1::new();
+
+        // Build PsbtInputs with tweaked signing keys for ECDH share computation
+        let psbt_inputs: Vec<PsbtInput> = selected_utxos
             .iter()
-            .map(|(outpoint, _)| TxIn {
-                previous_output: *outpoint,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+            .map(|(outpoint, output)| {
+                let tweaked_key = b_spend.add_tweak(&output.tweak)?;
+                Ok(PsbtInput::new(
+                    *outpoint,
+                    bitcoin::TxOut {
+                        value: output.value,
+                        script_pubkey: output.script_pubkey.clone(),
+                    },
+                    Sequence::MAX,
+                    Some(tweaked_key),
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        let sp_addresses: Vec<SilentPaymentAddress> = unsigned_transaction
-            .recipients
-            .iter()
-            .filter_map(|r| match &r.address {
-                RecipientAddress::SpAddress(sp_address) => Some(sp_address.to_owned()),
-                _ => None,
-            })
-            .collect();
-
-        let sp_address2xonlypubkeys = silentpayments::sending::generate_recipient_pubkeys(
-            sp_addresses,
-            unsigned_transaction.partial_secret,
-        )?;
-
-        let tx_outs = unsigned_transaction
-            .recipients
+        // Build PsbtOutputs
+        let psbt_outputs: Vec<PsbtOutput> = recipients
             .iter()
             .map(|recipient| match &recipient.address {
-                RecipientAddress::SpAddress(s) => {
-                    // We now need to fill the sp outputs with actual spk
-                    let pubkeys = sp_address2xonlypubkeys
-                        .get(s)
-                        .ok_or(Error::msg("Unknown sp address"))?;
-
-                    // we currently only allow having 1 output per silent payment address
-                    // note: when changing this, it should also be accounted for in 'create_new_transaction'
-                    if pubkeys.len() == 1 {
-                        let pubkey = pubkeys[0];
-                        let script = ScriptBuf::new_p2tr_tweaked(pubkey.dangerous_assume_tweaked());
-                        Ok(TxOut {
-                            value: recipient.amount,
-                            script_pubkey: script,
-                        })
-                    } else {
-                        Err(Error::msg("multiple outputs not supported"))
-                    }
-                }
                 RecipientAddress::LegacyAddress(unchecked_address) => {
                     let script = unchecked_address
                         .clone()
-                        .require_network(unsigned_transaction.network)?
+                        .require_network(network)?
                         .script_pubkey();
-
-                    Ok(TxOut {
-                        value: recipient.amount,
-                        script_pubkey: script,
-                    })
+                    Ok(PsbtOutput::regular(recipient.amount, script))
+                }
+                RecipientAddress::SpAddress(sp_address) => {
+                    if sp_address.get_network() != address_sp_network {
+                        return Err(Error::msg(format!(
+                            "Wrong network for address {}",
+                            sp_address
+                        )));
+                    }
+                    Ok(PsbtOutput::silent_payment(recipient.amount, sp_address.clone(), None))
                 }
                 RecipientAddress::Data(data) => {
                     if recipient.amount > Amount::from_sat(0) {
@@ -326,118 +283,104 @@ impl SpClient {
                     }
                     let mut op_return = PushBytesBuf::with_capacity(data_len);
                     op_return.extend_from_slice(data)?;
-                    let script = ScriptBuf::new_op_return(op_return);
-                    Ok(TxOut {
-                        value: recipient.amount,
-                        script_pubkey: script,
-                    })
+                    Ok(PsbtOutput::regular(
+                        recipient.amount,
+                        ScriptBuf::new_op_return(op_return),
+                    ))
                 }
             })
-            .collect::<Result<Vec<TxOut>>>()?;
+            .collect::<Result<Vec<_>>>()?;
 
-        let tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: tx_ins,
-            output: tx_outs,
+        let mut psbt = create_psbt(psbt_inputs.len(), psbt_outputs.len());
+        psbt.global.tx_version = Version::TWO;
+
+        construct_psbt(&mut psbt, &psbt_inputs, &psbt_outputs)
+            .map_err(|e| Error::msg(e.to_string()))?;
+
+        // Store the SP tweak per input so the signer can reconstruct the tweaked key
+        for (i, (_, output)) in selected_utxos.iter().enumerate() {
+            psbt.set_input_sp_tweak(i, output.tweak.to_be_bytes())
+                .map_err(|e| Error::msg(e.to_string()))?;
+        }
+
+        // Collect unique scan keys from SP recipients for ECDH share computation
+        let scan_keys: Vec<PublicKey> = {
+            let mut keys = vec![];
+            for recipient in recipients {
+                if let RecipientAddress::SpAddress(sp_address) = &recipient.address {
+                    let scan_key = sp_address.get_scan_key();
+                    if !keys.contains(&scan_key) {
+                        keys.push(scan_key);
+                    }
+                }
+            }
+            keys
         };
-        unsigned_transaction.unsigned_tx = Some(tx);
-        Ok(unsigned_transaction)
+
+        if !scan_keys.is_empty() {
+            add_ecdh_shares_full(&secp, &mut psbt, &psbt_inputs, &scan_keys, false)
+                .map_err(|e| Error::msg(e.to_string()))?;
+        }
+
+        Ok(psbt)
     }
 
-    fn taproot_sighash<
-        T: std::ops::Deref<Target = Transaction> + std::borrow::Borrow<Transaction>,
-    >(
-        hash_ty: bitcoin::TapSighashType,
-        prevouts: &[TxOut],
-        input_index: usize,
-        cache: &mut SighashCache<T>,
-        tapleaf_hash: Option<TapLeafHash>,
-    ) -> Result<Message, Error> {
-        let prevouts = Prevouts::All(prevouts);
-
-        let sighash = match tapleaf_hash {
-            Some(leaf_hash) => cache.taproot_script_spend_signature_hash(
-                input_index,
-                &prevouts,
-                leaf_hash,
-                hash_ty,
-            )?,
-            None => cache.taproot_key_spend_signature_hash(input_index, &prevouts, hash_ty)?,
-        };
-        let msg = Message::from_digest(sighash.to_byte_array());
-        Ok(msg)
+    /// Computes final output scripts for silent payment outputs from the ECDH shares in the PSBT.
+    pub fn finalize_transaction(psbt: &mut SilentPaymentPsbt) -> Result<()> {
+        let secp = Secp256k1::new();
+        finalize_sp_outputs(&secp, psbt).map_err(|e| Error::msg(e.to_string()))
     }
 
+    /// Signs all inputs and extracts the final transaction.
     pub fn sign_transaction(
         &self,
-        unsigned_tx: SilentPaymentUnsignedTransaction,
-        aux_rand: &[u8; 32],
-    ) -> Result<Transaction> {
-        // TODO check that we have aux_rand, at least that it's not all `0`s
+        mut psbt: SilentPaymentPsbt,
+        _aux_rand: &[u8; 32],
+    ) -> Result<bitcoin::Transaction> {
         let b_spend = self.try_get_secret_spend_key()?;
+        let secp = Secp256k1::new();
 
-        let to_sign = match unsigned_tx.unsigned_tx.as_ref() {
-            Some(tx) => tx,
-            None => return Err(Error::msg("Missing unsigned transaction")),
-        };
-
-        let mut signed = to_sign.clone();
-
-        let mut cache = SighashCache::new(to_sign);
-
-        let prevouts: Vec<_> = unsigned_tx
-            .selected_utxos
+        // Reconstruct PsbtInputs with the base spend key.
+        // sign_inputs will apply PSBT_IN_SP_TWEAK automatically for each P2TR input.
+        let psbt_inputs: Vec<PsbtInput> = psbt
+            .inputs
             .iter()
-            .map(|(_, output)| TxOut {
-                value: output.value,
-                script_pubkey: output.script_pubkey.clone(),
+            .map(|input| {
+                let outpoint = OutPoint {
+                    txid: input.previous_txid,
+                    vout: input.spent_output_index,
+                };
+                let witness_utxo = input
+                    .witness_utxo
+                    .clone()
+                    .map(|u| bitcoin::TxOut {
+                        value: u.value,
+                        script_pubkey: u.script_pubkey,
+                    })
+                    .unwrap_or(bitcoin::TxOut {
+                        value: Amount::ZERO,
+                        script_pubkey: ScriptBuf::new(),
+                    });
+                PsbtInput::new(
+                    outpoint,
+                    witness_utxo,
+                    input.sequence.unwrap_or(Sequence::MAX),
+                    Some(b_spend),
+                )
             })
             .collect();
 
-        let secp = Secp256k1::signing_only();
-        let sighash_type = bitcoin::TapSighashType::Default; // We impose Default for now
+        sign_inputs(&secp, &mut psbt, &psbt_inputs).map_err(|e| Error::msg(e.to_string()))?;
 
-        for (i, input) in to_sign.input.iter().enumerate() {
-            let tap_leaf_hash: Option<TapLeafHash> = None;
-
-            let msg = Self::taproot_sighash(sighash_type, &prevouts, i, &mut cache, tap_leaf_hash)?;
-
-            // Construct the signing key
-            let (_, owned_output) = unsigned_tx
-                .selected_utxos
-                .iter()
-                .find(|(outpoint, _)| *outpoint == input.previous_output)
-                .ok_or(Error::msg(format!(
-                    "prevout for output {} not in selected utxos",
-                    i
-                )))?;
-
-            let sk = b_spend.add_tweak(&owned_output.tweak)?;
-
-            let keypair = Keypair::from_secret_key(&secp, &sk);
-
-            let signature = secp.sign_schnorr_with_aux_rand(&msg, &keypair, aux_rand);
-
-            let mut witness = Witness::new();
-            witness.push(
-                Signature {
-                    signature,
-                    sighash_type,
-                }
-                .to_vec(),
-            );
-
-            signed.input[i].witness = witness;
-        }
-
-        Ok(signed)
+        extract_transaction(&mut psbt).map_err(|e| Error::msg(e.to_string()))
     }
 
     pub fn get_partial_secret_for_selected_utxos(
         &self,
         selected_utxos: &[(OutPoint, DiscoveredOutput)],
-    ) -> Result<SecretKey> {
+    ) -> Result<bitcoin::secp256k1::SecretKey> {
+        use silentpayments::utils as sp_utils;
+
         let b_spend = self.try_get_secret_spend_key()?;
 
         let outpoints: Vec<_> = selected_utxos
