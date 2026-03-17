@@ -6,7 +6,7 @@ use crate::psbt::core::{Error, Result, SilentPaymentPsbt};
 use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint};
 use bitcoin::key::XOnlyPublicKey;
 use bitcoin::taproot::TapLeafHash;
-use bitcoin::EcdsaSighashType;
+use bitcoin::{EcdsaSighashType, PublicKey};
 use psbt_v2::PsbtSighashType;
 
 /// BIP32 derivation information
@@ -46,7 +46,7 @@ pub fn add_input_bip32_derivation(
         .map(|&i| ChildNumber::from(i))
         .collect();
 
-    input.bip32_derivations.insert(*pubkey, (fingerprint, path));
+    input.bip32_derivations.insert(PublicKey::from(*pubkey), (fingerprint, path));
 
     Ok(())
 }
@@ -72,7 +72,7 @@ pub fn add_output_bip32_derivation(
 
     output
         .bip32_derivations
-        .insert(*pubkey, (fingerprint, path));
+        .insert(PublicKey::from(*pubkey), (fingerprint, path));
 
     Ok(())
 }
@@ -179,6 +179,7 @@ pub fn add_input_sighash_type(
 mod tests {
     use super::*;
     use crate::psbt::roles::creator::create_psbt;
+    use bitcoin::PrivateKey;
     use secp256k1::{Secp256k1, SecretKey};
 
     #[test]
@@ -186,11 +187,11 @@ mod tests {
         let mut psbt = create_psbt(1, 1);
         let secp = Secp256k1::new();
         let privkey = SecretKey::from_slice(&[1u8; 32]).unwrap();
-        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &privkey);
+        let pubkey = PublicKey::from_private_key(&secp, &PrivateKey::new(privkey, bitcoin::Network::Testnet));
 
         let derivation = Bip32Derivation::new([0xAA, 0xBB, 0xCC, 0xDD], vec![0x8000002C]);
 
-        add_input_bip32_derivation(&mut psbt, 0, &pubkey, &derivation).unwrap();
+        add_input_bip32_derivation(&mut psbt, 0, &pubkey.inner, &derivation).unwrap();
 
         // Verify derivation was added
         let input = &psbt.inputs[0];

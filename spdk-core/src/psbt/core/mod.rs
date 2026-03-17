@@ -9,6 +9,9 @@
 //! - UTXO types
 
 pub mod extensions;
+pub mod error;
+pub mod shares;
+pub mod types;
 
 pub use error::{Error, Result};
 pub use extensions::{
@@ -19,6 +22,7 @@ pub use shares::{
     aggregate_ecdh_shares, compute_sp_shared_secrets, AggregatedShare, AggregatedShares,
 };
 pub use types::{EcdhShareData, PsbtInput, PsbtOutput};
+pub use psbt_v2::v2::{Global, Input, Output};
 
 /// Type alias for PSBT v2 with BIP-375 extensions
 ///

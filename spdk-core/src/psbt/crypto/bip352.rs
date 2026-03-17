@@ -7,7 +7,7 @@ use bitcoin::key::TapTweak;
 use bitcoin::ScriptBuf;
 use psbt_v2::v2::Input;
 use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
-use silentpayments::bitcoin_hashes::Hash as SpHash;
+use silentpayments::bitcoin_hashes::{Hash as SpHash, HashEngine, sha256};
 use silentpayments::utils::hash::SharedSecretHash;
 use silentpayments::utils::NUMS_H;
 use std::collections::HashMap;
