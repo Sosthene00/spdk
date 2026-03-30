@@ -222,14 +222,6 @@ pub fn compute_sp_shared_secrets(
         .map(|input_idx| get_input_outpoint_bytes(psbt, input_idx))
         .collect::<Result<Vec<_>>>()?;
 
-    // If no eligible inputs, fall back to raw aggregated shares (no input_hash applied)
-    if outpoints.is_empty() {
-        return Ok(aggregated_shares
-            .iter()
-            .map(|(sk, agg)| (*sk, agg.aggregated_share))
-            .collect());
-    }
-
     let smallest_outpoint = outpoints
         .iter()
         .min()
@@ -307,7 +299,7 @@ pub fn compute_sp_shared_secrets(
             }
             // No pubkeys available: use raw aggregated share (fallback for test contexts
             // where inputs have no BIP32 derivation data)
-            None => agg.aggregated_share,
+            None => return Err(Error::Other("Fallback aggregated_shares required".to_string())),
         };
         shared_secrets.insert(*scan_key, shared_secret);
     }

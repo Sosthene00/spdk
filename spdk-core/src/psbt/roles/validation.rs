@@ -347,9 +347,13 @@ fn validate_dleq_proofs(secp: &Secp256k1<secp256k1::All>, psbt: &SilentPaymentPs
         }
 
         if let Some(proof) = share.dleq_proof {
-            // Aggregate all input public keys for global proof verification
+            // Aggregate eligible input public keys for global proof verification
             let mut input_pubkeys = Vec::new();
             for input_idx in 0..psbt.num_inputs() {
+                let input = &psbt.inputs[input_idx];
+                if !is_input_eligible(input) {
+                    continue;
+                }
                 let pubkey = get_input_pubkey(psbt, input_idx)?;
                 input_pubkeys.push(pubkey);
             }
