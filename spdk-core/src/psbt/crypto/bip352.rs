@@ -82,13 +82,18 @@ pub fn script_type_string(script: &ScriptBuf) -> &'static str {
 
 /// Check if an input is eligible for silent payments (BIP-352)
 pub fn is_input_eligible(input: &Input) -> bool {
-    // Check if input has witness_utxo
-    let witness_utxo = match &input.witness_utxo {
-        Some(utxo) => utxo,
-        None => return false,
+    // For segwit inputs, witness_utxo holds the TxOut directly.
+    // For legacy (P2PKH) inputs, extract the TxOut from the full non_witness_utxo transaction.
+    let script = if let Some(utxo) = &input.witness_utxo {
+        &utxo.script_pubkey
+    } else if let Some(tx) = &input.non_witness_utxo {
+        match tx.output.get(input.spent_output_index as usize) {
+            Some(txout) => &txout.script_pubkey,
+            None => return false,
+        }
+    } else {
+        return false;
     };
-
-    let script = &witness_utxo.script_pubkey;
 
     // P2WPKH (SegWit v0) - eligible
     if script.is_p2wpkh() {
