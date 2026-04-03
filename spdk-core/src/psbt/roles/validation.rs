@@ -3,7 +3,7 @@
 //! Validates PSBTs according to BIP-375 rules.
 
 use crate::psbt::core::{
-    aggregate_ecdh_shares, compute_sp_shared_secrets, get_input_outpoint_bytes, get_input_pubkey, Bip375PsbtExt, Error,
+    aggregate_ecdh_shares, compute_sp_shared_secrets, get_input_pubkey, Bip375PsbtExt, Error,
     Result, SilentPaymentPsbt,
 };
 use crate::psbt::crypto::{

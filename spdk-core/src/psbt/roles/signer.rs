@@ -18,6 +18,7 @@ use bitcoin::key::TapTweak;
 use bitcoin::ScriptBuf;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use std::collections::HashSet;
+use rand::RngCore;
 
 /// Add ECDH shares for all inputs (full signing)
 pub fn add_ecdh_shares_full(
@@ -40,7 +41,8 @@ pub fn add_ecdh_shares_full(
                 .map_err(|e| Error::Other(format!("ECDH computation failed: {}", e)))?;
 
             let dleq_proof = if include_dleq {
-                let rand_aux = [input_idx as u8; 32];
+                let mut rand_aux = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut rand_aux);
                 Some(
                     dleq_generate_proof(secp, privkey, scan_key, &rand_aux, None)
                         .map_err(|e| Error::Other(format!("DLEQ generation failed: {}", e)))?,
@@ -83,7 +85,8 @@ pub fn add_ecdh_shares_partial(
                 .map_err(|e| Error::Other(format!("ECDH computation failed: {}", e)))?;
 
             let dleq_proof = if include_dleq {
-                let rand_aux = [input_idx as u8; 32];
+                let mut rand_aux = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut rand_aux);
                 Some(
                     dleq_generate_proof(secp, base_privkey, scan_key, &rand_aux, None)
                         .map_err(|e| Error::Other(format!("DLEQ generation failed: {}", e)))?,

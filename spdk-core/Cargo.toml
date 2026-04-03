@@ -29,6 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 silentpayments.workspace = true
 psbt-v2.workspace = true
+rand.workspace = true
 rust-dleq.workspace = true
 secp256k1.workspace = true
 thiserror.workspace = true
