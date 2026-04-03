@@ -15,8 +15,7 @@ use silentpayments::Network as SpNetwork;
 use spdk_core::constants::{DATA_CARRIER_SIZE, NUMS};
 use spdk_core::psbt::core::{Bip375PsbtExt, PsbtInput, PsbtOutput, SilentPaymentPsbt};
 use spdk_core::psbt::roles::{
-    add_ecdh_shares_full, construct_psbt, create_psbt, extract_transaction, finalize_sp_outputs,
-    sign_inputs,
+    add_ecdh_shares_full, construct_psbt, create_psbt, extract_transaction, finalize_input_witnesses, finalize_sp_outputs, sign_inputs
 };
 use spdk_core::updater::DiscoveredOutput;
 
@@ -371,6 +370,8 @@ impl SpClient {
             .collect();
 
         sign_inputs(&secp, &mut psbt, &psbt_inputs).map_err(|e| Error::msg(e.to_string()))?;
+
+        finalize_input_witnesses(&mut psbt).map_err(|e| Error::msg(e.to_string()))?;
 
         extract_transaction(&mut psbt).map_err(|e| Error::msg(e.to_string()))
     }
