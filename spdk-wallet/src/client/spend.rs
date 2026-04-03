@@ -318,7 +318,7 @@ impl SpClient {
         };
 
         if !scan_keys.is_empty() {
-            add_ecdh_shares_full(&secp, &mut psbt, &psbt_inputs, &scan_keys, false)
+            add_ecdh_shares_full(&secp, &mut psbt, &psbt_inputs, &scan_keys, true)
                 .map_err(|e| Error::msg(e.to_string()))?;
         }
 
