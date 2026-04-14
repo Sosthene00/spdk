@@ -2,13 +2,13 @@
 mod common;
 #[cfg(test)]
 mod tests {
-    use bitcoin::{OutPoint, Txid};
+    use bitcoin::{OutPoint, Script, Txid, Witness};
     use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
     use silentpayments::{
         receiving::Label,
         utils::{
             receiving::{
-                calculate_ecdh_shared_secret, calculate_tweak_data, get_pubkey_from_input, is_p2tr,
+                calculate_ecdh_shared_secret, calculate_tweak_data, get_pubkey_from_input,
             },
             sending::calculate_partial_secret,
         },
@@ -61,10 +61,10 @@ mod tests {
                 let txinwitness = deser_string_vector(&mut cursor).unwrap();
                 let script_pub_key = hex::decode(&input.prevout.scriptPubKey.hex).unwrap();
 
-                match get_pubkey_from_input(&script_sig, &txinwitness, &script_pub_key) {
+                match get_pubkey_from_input(Script::from_bytes(&script_sig), &Witness::from_slice(&txinwitness), &Script::from_bytes(&script_pub_key)) {
                     Ok(Some(_pubkey)) => input_priv_keys.push((
                         SecretKey::from_str(&input.private_key).unwrap(),
-                        is_p2tr(&script_pub_key),
+                        Script::from_bytes(&script_pub_key).is_p2tr(),
                     )),
                     Ok(None) => (),
                     Err(e) => panic!("Problem parsing the input: {:?}", e),
@@ -123,7 +123,7 @@ mod tests {
                 let txinwitness = deser_string_vector(&mut cursor).unwrap();
                 let script_pub_key = hex::decode(&input.prevout.scriptPubKey.hex).unwrap();
 
-                match get_pubkey_from_input(&script_sig, &txinwitness, &script_pub_key) {
+                match get_pubkey_from_input(Script::from_bytes(&script_sig), &Witness::from_slice(&txinwitness), &Script::from_bytes(&script_pub_key)) {
                     Ok(Some(pubkey)) => input_pub_keys.push(pubkey),
                     Ok(None) => (),
                     Err(e) => panic!("Problem parsing the input: {:?}", e),

@@ -1,12 +1,8 @@
 //! Receiving utility functions.
 use crate::{
-    utils::{
-        OP_0, OP_1, OP_CHECKSIG, OP_DUP, OP_EQUAL, OP_EQUALVERIFY, OP_HASH160, OP_PUSHBYTES_20,
-        OP_PUSHBYTES_32,
-    },
     Error, Result,
 };
-use bitcoin::OutPoint;
+use bitcoin::{OutPoint, Script, Witness};
 use bitcoin_hashes::{hash160, Hash};
 use secp256k1::{ecdh::shared_secret_point, Parity::Even, XOnlyPublicKey};
 use secp256k1::{PublicKey, SecretKey};
@@ -83,19 +79,21 @@ pub fn calculate_ecdh_shared_secret(tweak_data: &PublicKey, b_scan: &SecretKey) 
 ///
 /// * The provided Vin data is incorrect.
 pub fn get_pubkey_from_input(
-    script_sig: &[u8],
-    txinwitness: &Vec<Vec<u8>>,
-    script_pub_key: &[u8],
+    script_sig: &Script,
+    txinwitness: &Witness,
+    script_pub_key: &Script,
 ) -> Result<Option<PublicKey>> {
-    if is_p2pkh(script_pub_key) {
+    if script_pub_key.is_p2pkh() {
         match (txinwitness.is_empty(), script_sig.is_empty()) {
             (true, false) => {
-                let spk_hash = &script_pub_key[3..23];
+                let spk_hash = &script_pub_key.as_bytes()[3..23];
                 for i in (COMPRESSED_PUBKEY_SIZE..=script_sig.len()).rev() {
-                    if let Some(pubkey_bytes) = script_sig.get(i - COMPRESSED_PUBKEY_SIZE..i) {
-                        let pubkey_hash = hash160::Hash::hash(pubkey_bytes);
-                        if pubkey_hash.to_byte_array() == spk_hash {
-                            return Ok(Some(PublicKey::from_slice(pubkey_bytes)?));
+                    if let Some(pubkey_bytes) = script_sig.as_bytes().get(i - COMPRESSED_PUBKEY_SIZE..i) {
+                        if let Ok(pubkey) = PublicKey::from_slice(pubkey_bytes) {
+                            let pubkey_hash = hash160::Hash::hash(pubkey_bytes);
+                            if pubkey_hash.to_byte_array() == spk_hash {
+                                return Ok(Some(pubkey));
+                            }
                         }
                     } else {
                         return Ok(None);
@@ -113,11 +111,11 @@ pub fn get_pubkey_from_input(
                 ))
             }
         }
-    } else if is_p2sh(script_pub_key) {
+    } else if script_pub_key.is_p2sh() {
         match (txinwitness.is_empty(), script_sig.is_empty()) {
             (false, false) => {
                 let redeem_script = &script_sig[1..];
-                if is_p2wpkh(redeem_script) {
+                if redeem_script.is_p2wpkh() {
                     if let Some(value) = txinwitness.last() {
                         match (
                             PublicKey::from_slice(value),
@@ -145,7 +143,7 @@ pub fn get_pubkey_from_input(
             }
             (true, false) => return Ok(None),
         }
-    } else if is_p2wpkh(script_pub_key) {
+    } else if script_pub_key.is_p2wpkh() {
         match (txinwitness.is_empty(), script_sig.is_empty()) {
             (false, true) => {
                 if let Some(value) = txinwitness.last() {
@@ -180,7 +178,7 @@ pub fn get_pubkey_from_input(
                 ))
             }
         }
-    } else if is_p2tr(script_pub_key) {
+    } else if script_pub_key.is_p2tr() {
         match (txinwitness.is_empty(), script_sig.is_empty()) {
             (false, true) => {
                 // check for the optional annex
@@ -197,7 +195,7 @@ pub fn get_pubkey_from_input(
                 }
 
                 // Return the pubkey from the script pubkey
-                return XOnlyPublicKey::from_slice(&script_pub_key[2..34])
+                return XOnlyPublicKey::from_slice(&script_pub_key.as_bytes()[2..34])
                     .map_err(Error::Secp256k1Error)
                     .map(|x_only_public_key| {
                         Some(PublicKey::from_x_only_public_key(x_only_public_key, Even))
