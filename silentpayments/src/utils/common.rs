@@ -72,6 +72,26 @@ impl TryFrom<&str> for Network {
     }
 }
 
+impl From<bitcoin::Network> for Network {
+    fn from(value: bitcoin::Network) -> Self {
+        match value {
+            bitcoin::Network::Bitcoin => Network::Mainnet,
+            bitcoin::Network::Signet | bitcoin::Network::Testnet | bitcoin::Network::Testnet4 => Network::Testnet,
+            bitcoin::Network::Regtest => Network::Regtest
+        }
+    }
+}
+
+impl From<Network> for bitcoin::Network {
+    fn from(value: Network) -> Self {
+        match value {
+            Network::Mainnet => Self::Bitcoin,
+            Network::Testnet => Self::Testnet, // We may lose information here
+            Network::Regtest => Self::Regtest,
+        }
+    }
+}
+
 /// A silent payment address struct that can be used to deserialize a silent payment address string.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct SilentPaymentAddress {

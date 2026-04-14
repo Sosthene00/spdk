@@ -1,4 +1,5 @@
 use crate::Error;
+use bitcoin::{OutPoint, consensus::serialize};
 use bitcoin_hashes::{sha256t_hash_newtype, Hash, HashEngine};
 use secp256k1::{PublicKey, Scalar, SecretKey};
 
@@ -29,9 +30,9 @@ sha256t_hash_newtype! {
 }
 
 impl InputsHash {
-    pub fn from_outpoint_and_A_sum(smallest_outpoint: &[u8; 36], A_sum: PublicKey) -> InputsHash {
+    pub fn from_outpoint_and_A_sum(smallest_outpoint: &OutPoint, A_sum: PublicKey) -> InputsHash {
         let mut eng = InputsHash::engine();
-        eng.input(smallest_outpoint);
+        eng.input(&serialize(smallest_outpoint));
         eng.input(&A_sum.serialize());
         InputsHash::from_engine(eng)
     }
@@ -65,45 +66,20 @@ impl SharedSecretHash {
 }
 
 pub fn calculate_input_hash(
-    outpoints_data: &[(String, u32)],
+    outpoints: &[OutPoint],
     A_sum: PublicKey,
 ) -> Result<Scalar, Error> {
-    if outpoints_data.is_empty() {
+    if outpoints.is_empty() {
         return Err(Error::GenericError("No outpoints provided".to_owned()));
     }
 
-    let mut outpoints: Vec<[u8; 36]> = Vec::with_capacity(outpoints_data.len());
+    let smallest_outpoint = outpoints
+        .iter()
+        // BIP352 selects the lexicographically smallest serialized outpoint.
+        // `OutPoint`'s derived `Ord` compares `vout` numerically, but consensus
+        // serialization uses little-endian bytes for `vout`.
+        .min_by_key(|outpoint| serialize(outpoint))
+        .expect("non-empty outpoints checked above");
 
-    // should probably just use an OutPoints type properly at some point
-    for (txid, vout) in outpoints_data {
-        let mut bytes: Vec<u8> = hex::decode(txid.as_str())?;
-
-        if bytes.len() != 32 {
-            return Err(Error::GenericError(format!(
-                "Invalid outpoint hex representation: {}",
-                txid
-            )));
-        }
-
-        // txid in string format is big endian and we need little endian
-        bytes.reverse();
-
-        let mut buffer = [0u8; 36];
-
-        buffer[..32].copy_from_slice(&bytes);
-        buffer[32..].copy_from_slice(&vout.to_le_bytes());
-        outpoints.push(buffer);
-    }
-
-    // sort outpoints
-    outpoints.sort_unstable();
-
-    if let Some(smallest_outpoint) = outpoints.first() {
-        Ok(InputsHash::from_outpoint_and_A_sum(smallest_outpoint, A_sum).to_scalar())
-    } else {
-        // This should never happen
-        Err(Error::GenericError(
-            "Unexpected empty outpoints vector".to_owned(),
-        ))
-    }
+    Ok(InputsHash::from_outpoint_and_A_sum(smallest_outpoint, A_sum).to_scalar())
 }

@@ -1,5 +1,6 @@
 //! Sending utility functions.
 use crate::{Error, Result};
+use bitcoin::OutPoint;
 use secp256k1::{ecdh::shared_secret_point, PublicKey, Secp256k1, SecretKey};
 
 use super::hash::calculate_input_hash;
@@ -23,14 +24,14 @@ use super::hash::calculate_input_hash;
 /// * The outpoints_data is of length zero, or invalid.
 pub fn calculate_partial_secret(
     input_keys: &[(SecretKey, bool)],
-    outpoints_data: &[(String, u32)],
+    outpoints: &[OutPoint],
 ) -> Result<SecretKey> {
     let a_sum = get_a_sum_secret_keys(input_keys)?;
 
     let secp = Secp256k1::signing_only();
     let A_sum = a_sum.public_key(&secp);
 
-    let input_hash = calculate_input_hash(outpoints_data, A_sum)?;
+    let input_hash = calculate_input_hash(outpoints, A_sum)?;
 
     Ok(a_sum.mul_tweak(&input_hash)?)
 }

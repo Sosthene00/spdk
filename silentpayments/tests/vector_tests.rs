@@ -2,6 +2,7 @@
 mod common;
 #[cfg(test)]
 mod tests {
+    use bitcoin::{OutPoint, Txid};
     use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
     use silentpayments::{
         receiving::Label,
@@ -47,10 +48,10 @@ mod tests {
         for sendingtest in test_case.sending {
             let given = sendingtest.given;
             let expected = sendingtest.expected;
-            let outpoints: Vec<(String, u32)> = given
+            let outpoints: Vec<OutPoint> = given
                 .vin
                 .iter()
-                .map(|vin| (vin.txid.clone(), vin.vout))
+                .map(|vin| OutPoint::new(Txid::from_str(&vin.txid).unwrap(), vin.vout))
                 .collect();
             let mut input_priv_keys = Vec::new();
             for input in given.vin {
@@ -87,6 +88,7 @@ mod tests {
                     sending_outputs.insert(hex::encode(pubkey.serialize()));
                 }
             }
+            println!("{:?}", sending_outputs);
             assert!(expected.outputs.iter().any(|candidate_set| {
                 sending_outputs
                     .iter()
@@ -108,10 +110,10 @@ mod tests {
 
             let outputs_to_check = decode_outputs_to_check(&given.outputs);
 
-            let outpoints: Vec<(String, u32)> = given
+            let outpoints: Vec<OutPoint> = given
                 .vin
                 .iter()
-                .map(|vin| (vin.txid.clone(), vin.vout))
+                .map(|vin| OutPoint::new(Txid::from_str(&vin.txid).unwrap(), vin.vout))
                 .collect();
             let mut input_pub_keys = Vec::new();
             for input in given.vin {
