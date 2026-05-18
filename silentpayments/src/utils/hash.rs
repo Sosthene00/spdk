@@ -32,7 +32,7 @@ sha256t_hash_newtype! {
 impl InputsHash {
     pub(crate) fn from_outpoint_and_A_sum(
         smallest_outpoint: &[u8; 36],
-        A_sum: PublicKey,
+        A_sum: &PublicKey,
     ) -> InputsHash {
         let mut eng = InputsHash::engine();
         eng.input(smallest_outpoint);
@@ -71,7 +71,7 @@ impl SharedSecretHash {
 pub fn calculate_input_hash(
     outpoint_head: &[u8; OUTPOINTS_LEN],
     outpoints_tail: &[[u8; OUTPOINTS_LEN]],
-    A_sum: PublicKey,
+    A_sum: &PublicKey,
 ) -> Scalar {
     let smallest_outpoint = outpoints_tail
         .iter()

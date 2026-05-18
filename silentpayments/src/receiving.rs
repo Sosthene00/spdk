@@ -16,10 +16,11 @@ use std::{
 };
 
 use crate::{
-    Error, Network, Result, SilentPaymentAddress, utils::{
-        common::{SpVersion, calculate_P_n, calculate_t_n},
+    utils::{
+        common::{calculate_P_n, calculate_t_n, InputHashApplied, SharedSecret, SpVersion},
         hash::LabelHash,
-    }
+    },
+    Error, Network, Result, SilentPaymentAddress,
 };
 use bimap::BiMap;
 use secp256k1::{Parity, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
@@ -379,7 +380,7 @@ impl Receiver {
     /// * An error occurs during elliptic curve computation. This may happen if a sender is being malicious.
     pub fn scan_transaction(
         &self,
-        ecdh_shared_secret: &PublicKey,
+        ecdh_shared_secret: &SharedSecret<InputHashApplied>,
         pubkeys_to_check: &[XOnlyPublicKey],
     ) -> Result<HashMap<Option<Label>, HashMap<XOnlyPublicKey, Scalar>>> {
         let secp = secp256k1::Secp256k1::verification_only();
@@ -439,7 +440,7 @@ impl Receiver {
     /// * An error occurs during elliptic curve computation. This may happen if a sender is being malicious.
     pub fn get_spks_from_shared_secret(
         &self,
-        ecdh_shared_secret: &PublicKey,
+        ecdh_shared_secret: &SharedSecret<InputHashApplied>,
     ) -> Result<HashMap<Option<Label>, [u8; 34]>> {
         let secp = Secp256k1::verification_only();
         let t_0: SecretKey = calculate_t_n(ecdh_shared_secret, 0)?;

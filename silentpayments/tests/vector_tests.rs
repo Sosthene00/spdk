@@ -2,14 +2,17 @@
 mod common;
 #[cfg(test)]
 mod tests {
-    use bitcoin::{OutPoint, Txid, consensus::serialize};
+    use bitcoin::{consensus::serialize, OutPoint, Txid};
     use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
     use silentpayments::{
-        Network, SilentPaymentAddress, SpVersion, receiving::Label, sending::GeneratePubkeysInput, utils::{
-            is_p2tr, receiving::{
-                calculate_ecdh_shared_secret, calculate_tweak_data, get_pubkey_from_input,
-            }, sending::calculate_partial_secret
-        }
+        receiving::Label,
+        sending::GeneratePubkeysInput,
+        utils::{
+            common::Raw,
+            is_p2tr,
+            receiving::{get_pubkey_from_input, PublicTweak},
+        },
+        Network, SilentPaymentAddress, SpVersion,
     };
     use std::{collections::HashSet, io::Cursor, str::FromStr};
 
@@ -49,7 +52,11 @@ mod tests {
             let outpoints: Vec<[u8; 36]> = given
                 .vin
                 .iter()
-                .map(|vin| serialize(&OutPoint::new(Txid::from_str(&vin.txid).unwrap(), vin.vout)).try_into().unwrap())
+                .map(|vin| {
+                    serialize(&OutPoint::new(Txid::from_str(&vin.txid).unwrap(), vin.vout))
+                        .try_into()
+                        .unwrap()
+                })
                 .collect();
             let mut input_priv_keys = Vec::new();
             for input in given.vin {
@@ -78,7 +85,12 @@ mod tests {
 
             // as an alternative, we could first multiply each input priv key with the input hash
             // that way, we never expose the sk to our library
-            let partial_secret = calculate_partial_secret(&secp, &input_priv_keys, &outpoints).unwrap();
+            let partial_secret = silentpayments::utils::sending::calculate_partial_secret(
+                &secp,
+                &input_priv_keys,
+                &outpoints,
+            )
+            .unwrap();
             let mut inputs: Vec<GeneratePubkeysInput> = Vec::new();
             for addr in silent_addresses {
                 assert!(addr.get_network() == NETWORK);
@@ -87,7 +99,7 @@ mod tests {
                     let spend_key = addr.get_spend_key();
                     input.spend_keys.push(spend_key);
                 } else {
-                    let ecdh_shared_secret = calculate_ecdh_shared_secret(&scan_key, &partial_secret);
+                    let ecdh_shared_secret = partial_secret.calculate_ecdh_shared_secret(&scan_key);
                     let spend_keys = vec![addr.get_spend_key()];
                     let sp_version = SPVERSION;
                     let input = GeneratePubkeysInput {
@@ -124,14 +136,19 @@ mod tests {
             let B_scan = b_scan.public_key(&secp);
 
             let change_label = Label::new(b_scan, 0);
-            let mut sp_receiver = Receiver::new(SPVERSION, B_scan, B_spend, change_label, NETWORK).unwrap();
+            let mut sp_receiver =
+                Receiver::new(SPVERSION, B_scan, B_spend, change_label, NETWORK).unwrap();
 
             let outputs_to_check = decode_outputs_to_check(&given.outputs);
 
             let outpoints: Vec<[u8; 36]> = given
                 .vin
                 .iter()
-                .map(|vin| serialize(&OutPoint::new(Txid::from_str(&vin.txid).unwrap(), vin.vout)).try_into().unwrap())
+                .map(|vin| {
+                    serialize(&OutPoint::new(Txid::from_str(&vin.txid).unwrap(), vin.vout))
+                        .try_into()
+                        .unwrap()
+                })
                 .collect();
             let mut input_pub_keys = Vec::new();
             for input in given.vin {
@@ -182,8 +199,12 @@ mod tests {
 
             let (outpoints_head, outpoints_tail) = outpoints.split_first().unwrap();
 
-            let tweak_data = calculate_tweak_data(&secp, &input_pub_keys, outpoints_head, outpoints_tail).unwrap();
-            let ecdh_shared_secret = calculate_ecdh_shared_secret(&tweak_data, &b_scan);
+            let combined_keys = PublicKey::combine_keys(&input_pub_keys).unwrap();
+
+            let tweak_data = PublicTweak::<Raw>::from_inner(&combined_keys)
+                .calculate_tweak_data(&secp, outpoints_head, outpoints_tail)
+                .unwrap();
+            let ecdh_shared_secret = tweak_data.calculate_ecdh_shared_secret(&b_scan);
 
             let scanned_outputs_received = sp_receiver
                 .scan_transaction(&ecdh_shared_secret, &outputs_to_check)

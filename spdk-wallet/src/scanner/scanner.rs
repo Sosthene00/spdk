@@ -15,7 +15,10 @@ use bitcoin::{
 };
 use futures::{Stream, StreamExt, pin_mut};
 use log::info;
-use silentpayments::receiving::Label;
+use silentpayments::{
+    receiving::Label,
+    utils::common::{InputHashApplied, SharedSecret},
+};
 
 use spdk_core::chain::{BlockData, ChainBackend, FilterData, UtxoData};
 use spdk_core::updater::{DiscoveredOutput, Updater};
@@ -221,7 +224,7 @@ impl<'a> SpScanner<'a> {
     async fn scan_utxos(
         &self,
         blkheight: Height,
-        secrets_map: HashMap<[u8; 34], PublicKey>,
+        secrets_map: HashMap<[u8; 34], SharedSecret<InputHashApplied>>,
     ) -> Result<Vec<(Option<Label>, UtxoData, Scalar)>> {
         let utxos = self.backend.utxos(blkheight).await?;
 

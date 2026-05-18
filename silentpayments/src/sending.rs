@@ -13,17 +13,18 @@ use secp256k1::Signing;
 use secp256k1::{PublicKey, Secp256k1, XOnlyPublicKey};
 use std::collections::HashMap;
 
-use crate::Network;
-use crate::utils::common::SpVersion;
 use crate::utils::common::calculate_t_n;
+use crate::utils::common::SpVersion;
+use crate::utils::common::{InputHashApplied, SharedSecret};
+use crate::Network;
 use crate::Result;
 use crate::SilentPaymentAddress;
 
 #[derive(Debug)]
 pub struct GeneratePubkeysInput {
     pub scan_key: PublicKey,
-    pub ecdh_shared_secret: PublicKey,
-    pub spend_keys: Vec<PublicKey>, 
+    pub ecdh_shared_secret: SharedSecret<InputHashApplied>,
+    pub spend_keys: Vec<PublicKey>,
     pub sp_version: SpVersion,
 }
 
@@ -54,14 +55,15 @@ pub struct GeneratePubkeysInput {
 pub fn generate_recipient_pubkeys<C: Signing>(
     secp: &Secp256k1<C>,
     inputs: Vec<GeneratePubkeysInput>,
-    network: Network
+    network: Network,
 ) -> Result<HashMap<SilentPaymentAddress, Vec<XOnlyPublicKey>>> {
     let mut result: HashMap<SilentPaymentAddress, Vec<XOnlyPublicKey>> = HashMap::new();
     for input in inputs {
         let ecdh_shared_secret = &input.ecdh_shared_secret;
         let mut k = 0;
         for spend_key in input.spend_keys {
-            let address = SilentPaymentAddress::new(input.scan_key, spend_key, network, input.sp_version);
+            let address =
+                SilentPaymentAddress::new(input.scan_key, spend_key, network, input.sp_version);
             let t_n = calculate_t_n(ecdh_shared_secret, k)?;
             let res = t_n.public_key(secp);
             let reskey = res.combine(&address.get_spend_key())?;

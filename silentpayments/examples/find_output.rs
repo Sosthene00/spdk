@@ -11,10 +11,9 @@ use bitcoin_hashes::hex::FromHex;
 use silentpayments::SpVersion;
 // Import types from the silentpayments library
 use silentpayments::receiving::{Label, Receiver};
+use silentpayments::utils::common::Raw;
+use silentpayments::utils::receiving::{get_pubkey_from_input, PublicTweak};
 use silentpayments::utils::{MAIN_SCAN_PATH, MAIN_SPEND_PATH};
-use silentpayments::utils::receiving::{
-    calculate_ecdh_shared_secret, calculate_tweak_data, get_pubkey_from_input,
-};
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Get the command-line arguments
@@ -48,7 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         silentpayments::Network::Mainnet,
     )?;
 
-    assert_eq!(receiver.get_receiving_address().to_string().as_str(), "sp1qq2h0tcwserlsk6yszaa54jtse9s9ype47r4f0y9gkp7mn7zwn4q07qslxzntmfu5euy2dwj2v4wk8dxanurpzat628rvkdns2a8f2fk9gs9wazmu");
+    assert_eq!(receiver.get_receiving_address().to_string().as_str(), "sp1qqd767xzc5v9n7sew058ksvlw6f96ea3qzgh0yvg48d98zpkqa8l5vqklusltqgxchauhl5780qq9ygmj7758uh4anjmj72py7j7an0g27yhmkcrz");
 
     // Get the transaction hex string from the second command-line argument
     let tx_hex = args.get(2).unwrap();
@@ -88,13 +87,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Get the reference to a vector of public keys for further calculations
     let pubkeys_ref: Vec<&PublicKey> = input_pubkeys.iter().collect();
 
+    let combined_keys = PublicKey::combine_keys(&pubkeys_ref.as_slice()).unwrap();
+
     let (outpoints_head, outpoints_tail) = outpoints.split_first().unwrap();
 
     // Calculate the tweak data based on the public keys and outpoints
-    let tweak_data = calculate_tweak_data(&secp, &pubkeys_ref, outpoints_head, outpoints_tail)?;
+    let tweak_data = PublicTweak::<Raw>::from_inner(&combined_keys).calculate_tweak_data(
+        &secp,
+        outpoints_head,
+        outpoints_tail,
+    )?;
 
     // Calculate the ECDH shared secret between the scan private key and the tweak data
-    let ecdh_shared_secret = calculate_ecdh_shared_secret(&tweak_data, &scan_privkey);
+    let ecdh_shared_secret = tweak_data.calculate_ecdh_shared_secret(&scan_privkey);
 
     // Filter the transaction outputs that have a valid P2TR scriptpubkey
     let pubkeys_to_check: Vec<_> = tx
