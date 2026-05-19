@@ -1,11 +1,10 @@
-use std::{collections::HashMap, io::Write};
+use std::collections::HashMap;
 
 use bitcoin::{
     Network,
     secp256k1::{PublicKey, Secp256k1, SecretKey},
 };
 use serde::{Deserialize, Serialize};
-use silentpayments::bitcoin_hashes::Hash;
 use silentpayments::{
     Network as SpNetwork,
     utils::{
@@ -15,7 +14,6 @@ use silentpayments::{
 };
 use silentpayments::{
     SilentPaymentAddress,
-    bitcoin_hashes::sha256,
     receiving::{Label, Receiver},
 };
 
@@ -118,23 +116,5 @@ impl SpClient {
             }
         }
         Ok(res)
-    }
-
-    pub fn get_client_fingerprint(&self) -> Result<[u8; 8]> {
-        let sp_address: SilentPaymentAddress = self.get_receiving_address();
-        let scan_pk = sp_address.get_scan_key();
-        let spend_pk = sp_address.get_spend_key();
-
-        // take a fingerprint of the wallet by hashing its keys
-        let mut engine = sha256::HashEngine::default();
-        engine.write_all(&scan_pk.serialize())?;
-        engine.write_all(&spend_pk.serialize())?;
-        let hash = sha256::Hash::from_engine(engine);
-
-        // take first 8 bytes as fingerprint
-        let mut wallet_fingerprint = [0u8; 8];
-        wallet_fingerprint.copy_from_slice(&hash.to_byte_array()[..8]);
-
-        Ok(wallet_fingerprint)
     }
 }
