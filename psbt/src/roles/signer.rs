@@ -14,7 +14,7 @@ use crate::crypto::{dleq_generate_proof, dleq_verify_proof, sign_p2tr_input};
 use crate::roles::Bip375OutputConstructorExt;
 use bitcoin::sighash::SighashCache;
 use bitcoin::{key::TapTweak, CompressedPublicKey};
-use bitcoin::{PrivateKey, ScriptBuf, XOnlyPublicKey};
+use bitcoin::{PrivateKey, ScriptBuf, Witness, XOnlyPublicKey};
 use futures::future::Shared;
 use psbt_v2::v2::{Input, Signer};
 use rand::RngCore;
@@ -219,6 +219,7 @@ pub trait SignerPsbtExt {
     fn aggregate_ecdh_shares(&mut self, secp: &Secp256k1<secp256k1::All>) -> Result<()>;
     fn compute_sp_outputs(&mut self, secp: &Secp256k1<secp256k1::All>) -> Result<()>;
     fn sign_sp_inputs(&mut self, secp: &Secp256k1<secp256k1::All>, spend_key: SecretKey) -> Result<()>;
+    fn finalize(&mut self) -> Result<()>;
 }
 
 impl SignerPsbtExt for Psbt {
@@ -386,6 +387,23 @@ impl SignerPsbtExt for Psbt {
                 Ok(_) => (),
                 Err(e) => log::debug!("Failed to sign input {}: {}", idx, e.to_string())
             };
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<()> {
+        for (i, input) in self.inputs.iter_mut().enumerate() {
+            if let Some(sig) = input.tap_key_sig {
+                let mut witness = Witness::new();
+                witness.push(sig.to_vec());
+                input.final_script_sig = Some(ScriptBuf::new());
+                input.final_script_witness = Some(witness);
+                input.tap_key_sig = None;
+                input.sighash_type = None;
+            } else {
+                // We can't finalize a partially signed transaction
+                return Err(Error::InvalidPsbtState(format!("Missing signature on input {}", i)));
+            }
         }
         Ok(())
     }
