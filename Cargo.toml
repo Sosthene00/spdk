@@ -32,7 +32,7 @@ reqwest = { version = "0.12.4", features = [
   "gzip",
 ], default-features = false }
 secp256k1 = { version = "0.29.0" }
-psbt-v2 = { git = "https://github.com/Sosthene00/rust-psbt.git", branch = "bip376", features = ["silent-payments"] }
+psbt-v2 = { git = "https://github.com/Sosthene00/rust-psbt.git", branch = "taproot_sign", features = ["silent-payments"] }
 # psbt-v2 = { git = "https://github.com/macgyver13/rust-psbt.git", branch = "add-pairs-v2-map", features = ["silent-payments"] }
 rust-dleq = { git = "https://github.com/macgyver13/rust-dleq.git", branch = "master", default-features = false }
 rand = { version = "0.8", features = ["std"] }

@@ -7,127 +7,132 @@
 //! - **P2WPKH inputs**: Signs with ECDSA (SegWit v0) → `partial_sigs`
 //! - **P2TR inputs**: Signs with Schnorr (Taproot v1) → `tap_key_sig`, with optional SP tweak
 
-use crate::core::{
-    utils::is_input_eligible, Bip375PsbtExt, EcdhShareData, Error, PsbtInput, Result,
-    Psbt,
-};
-use crate::crypto::dleq_generate_proof;
-use bitcoin::ScriptBuf;
+use std::collections::HashMap;
+
+use crate::core::{utils::is_input_eligible, Bip375PsbtExt, EcdhShareData, Error, Psbt, Result};
+use crate::crypto::{dleq_generate_proof, dleq_verify_proof, sign_p2tr_input};
+use crate::roles::Bip375OutputConstructorExt;
+use bitcoin::sighash::SighashCache;
 use bitcoin::{key::TapTweak, CompressedPublicKey};
+use bitcoin::{PrivateKey, ScriptBuf, XOnlyPublicKey};
+use futures::future::Shared;
+use psbt_v2::v2::{Input, Signer};
 use rand::RngCore;
-use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
-use silentpayments::utils::common::SharedSecret;
+use secp256k1::{Parity, PublicKey, Scalar, Secp256k1, SecretKey};
+use silentpayments::sending::{generate_recipient_pubkeys, GeneratePubkeysInput};
+use silentpayments::utils::common::{InputHashApplied, SharedSecret};
+use silentpayments::utils::receiving::get_pubkey_from_input;
 use silentpayments::utils::{common::Raw, sending::TypedSecretKey};
 
-pub fn add_input_ecdh_share(
-    secp: &Secp256k1<secp256k1::All>,
-    psbt: &mut Psbt,
-    input_index: usize,
-    private_key: SecretKey,
-    include_dleq: bool,
-) -> Result<()> {
-    let scan_keys = psbt.get_output_scan_keys();
+// pub fn add_input_ecdh_share(
+//     secp: &Secp256k1<secp256k1::All>,
+//     psbt: &mut Psbt,
+//     input_index: usize,
+//     private_key: SecretKey,
+//     include_dleq: bool,
+// ) -> Result<()> {
+//     for
 
-    if scan_keys.is_empty() {
-        return Err(Error::Other("No silent payment outputs".to_string()));
-    }
+//     if scan_keys.is_empty() {
+//         return Err(Error::Other("No silent payment outputs".to_string()));
+//     }
 
-    let input = psbt
-        .inputs
-        .get_mut(input_index)
-        .ok_or(Error::InvalidInputIndex(input_index))?;
+//     let input = psbt
+//         .inputs
+//         .get_mut(input_index)
+//         .ok_or(Error::InvalidInputIndex(input_index))?;
 
-    let funding_utxo = input
-        .funding_utxo()
-        .map_err(|_| Error::InvalidInputIndex(input_index))?;
+//     let funding_utxo = input
+//         .funding_utxo()
+//         .map_err(|_| Error::InvalidInputIndex(input_index))?;
 
-    // Check that the utxo is eligible for silent payments
-    match is_input_eligible(input) {
-        Ok(false) => {
-            return Err(Error::Other(
-                "Input is not eligible for silent payments".to_string(),
-            ))
-        }
-        Ok(true) => (),
-        Err(e) => return Err(e), // likely we don't have the funding utxo yet
-    }
+//     // Check that the utxo is eligible for silent payments
+//     match is_input_eligible(input) {
+//         Ok(false) => {
+//             return Err(Error::Other(
+//                 "Input is not eligible for silent payments".to_string(),
+//             ))
+//         }
+//         Ok(true) => (),
+//         Err(e) => return Err(e), // likely we don't have the funding utxo yet
+//     }
 
-    let is_taproot = funding_utxo.script_pubkey.is_p2tr();
+//     let is_taproot = funding_utxo.script_pubkey.is_p2tr();
 
-    // BIP-352: for taproot inputs whose pubkey has odd y, negate the key
-    // so the ECDH share is consistent with the x-only (even-y) convention.
-    let normalized_privkey =
-        TypedSecretKey::<Raw>::new(private_key).normalize_for_input(secp, is_taproot);
+//     // BIP-352: for taproot inputs whose pubkey has odd y, negate the key
+//     // so the ECDH share is consistent with the x-only (even-y) convention.
+//     let normalized_privkey =
+//         TypedSecretKey::<Raw>::new(private_key).normalize_for_input(secp, is_taproot);
 
-    // Check that the provided private key matches the key spent
-    // We need the *_IN_DERIVATION fields set
-    let pubkey = bitcoin::PublicKey::from(normalized_privkey.as_inner().public_key(secp));
-    let has_any_bip32_derivations = !input.bip32_derivations.is_empty();
-    let private_key_matches_bip32_derivation = input.bip32_derivations.contains_key(&pubkey);
-    let compressed_pubkey =
-        CompressedPublicKey::try_from(pubkey).map_err(|_| Error::InvalidPublicKey)?;
-    let has_any_sp_spend_bip32_derivations = !input.sp_spend_bip32_derivations.is_empty();
-    let private_key_matches_sp_spend_bip32_derivation = input
-        .sp_spend_bip32_derivations
-        .contains_key(&compressed_pubkey);
+//     // Check that the provided private key matches the key spent
+//     // We need the *_IN_DERIVATION fields set
+//     let pubkey = bitcoin::PublicKey::from(normalized_privkey.as_inner().public_key(secp));
+//     let has_any_bip32_derivations = !input.bip32_derivations.is_empty();
+//     let private_key_matches_bip32_derivation = input.bip32_derivations.contains_key(&pubkey);
+//     let compressed_pubkey =
+//         CompressedPublicKey::try_from(pubkey).map_err(|_| Error::InvalidPublicKey)?;
+//     let has_any_sp_spend_bip32_derivations = !input.sp_spend_bip32_derivations.is_empty();
+//     let private_key_matches_sp_spend_bip32_derivation = input
+//         .sp_spend_bip32_derivations
+//         .contains_key(&compressed_pubkey);
 
-    if has_any_bip32_derivations && has_any_sp_spend_bip32_derivations {
-        return Err(Error::InvalidPsbtState(
-            "input cannot use both bip32_derivations and sp_spend_bip32_derivations".to_string(),
-        ));
-    }
+//     if has_any_bip32_derivations && has_any_sp_spend_bip32_derivations {
+//         return Err(Error::InvalidPsbtState(
+//             "input cannot use both bip32_derivations and sp_spend_bip32_derivations".to_string(),
+//         ));
+//     }
 
-    if has_any_sp_spend_bip32_derivations && !is_taproot {
-        return Err(Error::InvalidPsbtState(
-            "sp_spend_bip32_derivations is only valid for taproot inputs".to_string(),
-        ));
-    }
+//     if has_any_sp_spend_bip32_derivations && !is_taproot {
+//         return Err(Error::InvalidPsbtState(
+//             "sp_spend_bip32_derivations is only valid for taproot inputs".to_string(),
+//         ));
+//     }
 
-    if !private_key_matches_bip32_derivation && !private_key_matches_sp_spend_bip32_derivation {
-        return Err(Error::InvalidPsbtState(
-            "private key does not match any registered input derivation key (missing derivations or wrong private key)".to_string(),
-        ));
-    }
+//     if !private_key_matches_bip32_derivation && !private_key_matches_sp_spend_bip32_derivation {
+//         return Err(Error::InvalidPsbtState(
+//             "private key does not match any registered input derivation key (missing derivations or wrong private key)".to_string(),
+//         ));
+//     }
 
-    for scan_key in &scan_keys {
-        let ecdh_shared_secret: SharedSecret<Raw> =
-            normalized_privkey.calculate_ecdh_shared_secret(scan_key);
+//     for scan_key in &scan_keys {
+//         let ecdh_shared_secret: SharedSecret<Raw> =
+//             normalized_privkey.calculate_ecdh_shared_secret(scan_key);
 
-        let dleq_proof = if include_dleq {
-            let mut rand_aux = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut rand_aux);
-            Some(
-                dleq_generate_proof(
-                    secp,
-                    normalized_privkey.as_inner(),
-                    scan_key,
-                    &rand_aux,
-                    None,
-                )
-                .map_err(|e| Error::Other(format!("DLEQ generation failed: {}", e)))?,
-            )
-        } else {
-            None
-        };
+//         let dleq_proof = if include_dleq {
+//             let mut rand_aux = [0u8; 32];
+//             rand::thread_rng().fill_bytes(&mut rand_aux);
+//             Some(
+//                 dleq_generate_proof(
+//                     secp,
+//                     normalized_privkey.as_inner(),
+//                     scan_key,
+//                     &rand_aux,
+//                     None,
+//                 )
+//                 .map_err(|e| Error::Other(format!("DLEQ generation failed: {}", e)))?,
+//             )
+//         } else {
+//             None
+//         };
 
-        let compressed_scan_key =
-            CompressedPublicKey::try_from(bitcoin::PublicKey::from(*scan_key))
-                .map_err(|_| Error::InvalidPublicKey)?;
-        let compressed_shared_secret = CompressedPublicKey::try_from(bitcoin::PublicKey::from(
-            ecdh_shared_secret.into_inner(),
-        ))
-        .map_err(|_| Error::InvalidPublicKey)?;
+//         let compressed_scan_key =
+//             CompressedPublicKey::try_from(bitcoin::PublicKey::from(*scan_key))
+//                 .map_err(|_| Error::InvalidPublicKey)?;
+//         let compressed_shared_secret = CompressedPublicKey::try_from(bitcoin::PublicKey::from(
+//             ecdh_shared_secret.into_inner(),
+//         ))
+//         .map_err(|_| Error::InvalidPublicKey)?;
 
-        input
-            .sp_ecdh_shares
-            .insert(compressed_scan_key, compressed_shared_secret);
+//         input
+//             .sp_ecdh_shares
+//             .insert(compressed_scan_key, compressed_shared_secret);
 
-        if let Some(proof) = dleq_proof {
-            input.sp_dleq_proofs.insert(compressed_scan_key, proof);
-        }
-    }
-    Ok(())
-}
+//         if let Some(proof) = dleq_proof {
+//             input.sp_dleq_proofs.insert(compressed_scan_key, proof);
+//         }
+//     }
+//     Ok(())
+// }
 // /// Add ECDH shares for all inputs (full signing)
 // pub fn add_ecdh_shares_full(
 //     secp: &Secp256k1<secp256k1::All>,
@@ -210,322 +215,178 @@ pub fn add_input_ecdh_share(
 //     Ok(())
 // }
 
-/// Sign inputs based on their script type (P2PKH, P2WPKH, P2TR)
-///
-/// This function automatically detects the input type and applies the correct signing logic:
-/// - **P2PKH**: Signs with ECDSA (legacy)
-/// - **P2WPKH**: Signs with ECDSA (SegWit v0)
-/// - **P2TR**: Signs with Schnorr (Taproot v1). Checks for Silent Payment tweaks (`PSBT_IN_SP_TWEAK`)
-///   and applies them to the private key if present.
-pub fn sign_inputs(
-    secp: &Secp256k1<secp256k1::All>,
-    psbt: &mut Psbt,
-    private_keys: &std::collections::HashMap<usize, SecretKey>,
-) -> Result<()> {
-    let tx = extract_tx_for_signing(psbt)?;
-
-    for (input_idx, privkey) in private_keys.iter() {
-        let input = if let Some(input) = psbt.inputs.get(*input_idx) {
-            input
-        } else {
-            return Err(Error::Other(format!("Input {} not found", input_idx)));
-        };
-
-        if input.witness_utxo.is_none() {
-            return Err(Error::Other(format!(
-                "Input {} missing witness_utxo",
-                input_idx
-            )));
-        }
-
-        let witness_utxo = input.witness_utxo.as_ref().unwrap();
-
-        if witness_utxo.script_pubkey.is_p2pkh() {
-            let signature = sign_p2pkh_input(
-                secp,
-                &tx,
-                *input_idx,
-                &witness_utxo.script_pubkey,
-                witness_utxo.value, // Not needed for legacy but passed
-                privkey,
-            )
-            .map_err(|e| Error::Other(format!("P2PKH signing failed: {}", e)))?;
-
-            let pubkey = PublicKey::from_secret_key(secp, privkey);
-            let bitcoin_pubkey = bitcoin::PublicKey::new(pubkey);
-
-            let sig = bitcoin::ecdsa::Signature::from_slice(&signature)
-                .map_err(|e| Error::Other(format!("Invalid signature DER: {}", e)))?;
-
-            psbt.inputs[*input_idx]
-                .partial_sigs
-                .insert(bitcoin_pubkey, sig);
-        } else if witness_utxo.script_pubkey.is_p2wpkh() {
-            let signature = sign_p2wpkh_input(
-                secp,
-                &tx,
-                *input_idx,
-                &witness_utxo.script_pubkey,
-                witness_utxo.value,
-                privkey,
-            )
-            .map_err(|e| Error::Other(format!("P2WPKH signing failed: {}", e)))?;
-
-            let pubkey = PublicKey::from_secret_key(secp, privkey);
-            let bitcoin_pubkey = bitcoin::PublicKey::new(pubkey);
-
-            let sig = bitcoin::ecdsa::Signature::from_slice(&signature)
-                .map_err(|e| Error::Other(format!("Invalid signature DER: {}", e)))?;
-
-            psbt.inputs[*input_idx]
-                .partial_sigs
-                .insert(bitcoin_pubkey, sig);
-        } else if witness_utxo.script_pubkey.is_p2tr() {
-            sign_p2tr_with_optional_tweak(secp, psbt, &tx, *input_idx, privkey)?;
-        }
-    }
-    Ok(())
+pub trait SignerPsbtExt {
+    fn aggregate_ecdh_shares(&mut self, secp: &Secp256k1<secp256k1::All>) -> Result<()>;
+    fn compute_sp_outputs(&mut self, secp: &Secp256k1<secp256k1::All>) -> Result<()>;
+    fn sign_sp_inputs(&mut self, secp: &Secp256k1<secp256k1::All>, spend_key: SecretKey) -> Result<()>;
 }
 
-/// Sign a P2TR input, applying SP tweak if present.
-///
-/// Builds prevouts from the PSBT, checks for `PSBT_IN_SP_TWEAK`, and signs with
-/// BIP-340 Schnorr. If a tweak is present, it is applied to the private key before signing.
-fn sign_p2tr_with_optional_tweak(
-    secp: &Secp256k1<secp256k1::All>,
-    psbt: &mut Psbt,
-    tx: &bitcoin::Transaction,
-    input_idx: usize,
-    privkey: &SecretKey,
-) -> Result<()> {
-    let prevouts: Vec<bitcoin::TxOut> = psbt
-        .inputs
-        .iter()
-        .enumerate()
-        .map(|(idx, input)| {
-            input.witness_utxo.clone().ok_or(Error::Other(format!(
-                "Input {} missing witness_utxo (required for P2TR)",
-                idx
-            )))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let tweak = psbt.get_input_sp_tweak(input_idx);
-    let signing_key = if let Some(tweak) = tweak {
-        let tweak_scalar = Scalar::from_be_bytes(tweak).unwrap();
-
-        let mut tweaked = *privkey;
-        tweaked = tweaked.add_tweak(&tweak_scalar).unwrap();
-
-        tweaked
-    } else {
-        *privkey
-    };
-
-    let signature = sign_p2tr_input(secp, tx, input_idx, &prevouts, &signing_key)
-        .map_err(|e| Error::Other(format!("Schnorr signing failed: {}", e)))?;
-
-    psbt.inputs[input_idx].tap_key_sig = Some(signature);
-    Ok(())
-}
-
-/// Extract transaction data needed for signing
-fn extract_tx_for_signing(psbt: &Psbt) -> Result<bitcoin::Transaction> {
-    use bitcoin::{absolute::LockTime, OutPoint, Sequence, Transaction, TxIn, TxOut};
-
-    let global = &psbt.global;
-    let version = global.tx_version; // Already Version type
-    let lock_time = global.fallback_lock_time.unwrap_or(LockTime::ZERO);
-
-    let mut inputs = Vec::new();
-    for input in &psbt.inputs {
-        inputs.push(TxIn {
-            previous_output: OutPoint {
-                txid: input.previous_txid,
-                vout: input.spent_output_index,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: input.sequence.unwrap_or(Sequence::MAX),
-            witness: bitcoin::Witness::new(),
-        });
-    }
-
-    let mut outputs = Vec::new();
-    for output in &psbt.outputs {
-        outputs.push(TxOut {
-            value: output.amount, // Already Amount type
-            script_pubkey: output.script_pubkey.clone(),
-        });
-    }
-
-    Ok(Transaction {
-        version,
-        lock_time,
-        input: inputs,
-        output: outputs,
-    })
-}
-
-pub fn get_signable_inputs(
-    _secp: &Secp256k1<secp256k1::All>,
-    psbt: &Psbt,
-    public_key: &PublicKey,
-) -> Vec<usize> {
-    let mut signable = Vec::new();
-    let bitcoin_pubkey = bitcoin::PublicKey::new(*public_key);
-
-    for (idx, input) in psbt.inputs.iter().enumerate() {
-        if input.partial_sigs.contains_key(&bitcoin_pubkey) || input.tap_key_sig.is_some() {
-            continue;
-        }
-
-        if let Some(witness_utxo) = &input.witness_utxo {
-            if witness_utxo.script_pubkey.is_p2wpkh() {
-                let expected_script = pubkey_to_p2wpkh_script(public_key);
-                if witness_utxo.script_pubkey == expected_script {
-                    signable.push(idx);
+impl SignerPsbtExt for Psbt {
+    fn aggregate_ecdh_shares(&mut self, secp: &Secp256k1<secp256k1::All>) -> Result<()> {
+        let scan_keys = self
+            .outputs
+            .iter()
+            .filter_map(|o| {
+                if let Some((scan_key, _)) = o.get_sp_info() {
+                    Some(scan_key)
+                } else {
+                    None
                 }
-            } else if witness_utxo.script_pubkey.is_p2tr() {
-                let (xonly, _) = public_key.x_only_public_key();
-                let tweaked_pubkey = xonly.dangerous_assume_tweaked();
+            })
+            .collect::<Vec<_>>();
 
-                use bitcoin::ScriptBuf;
-                let expected_script = ScriptBuf::new_p2tr_tweaked(tweaked_pubkey);
-                if witness_utxo.script_pubkey == expected_script {
-                    signable.push(idx);
-                }
+        let mut global_ecdh_shares: HashMap<PublicKey, Vec<PublicKey>> =
+            scan_keys.iter().map(|key| (*key, Vec::new())).collect();
+
+        for (i, input) in self.inputs.iter_mut().enumerate() {
+            // First check that we're spending a silent payment eligible output
+            if !is_input_eligible(&input)? {
+                continue;
             }
-        }
-    }
 
-    signable
-}
-
-pub fn get_unsigned_inputs(psbt: &Psbt) -> Vec<usize> {
-    psbt.inputs
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, input)| {
-            if input.partial_sigs.is_empty() && input.tap_key_sig.is_none() {
-                Some(idx)
+            // We need to take the pubkey being spent
+            // If we're spending a sp output, we need to take the bip32 derivation and tweak
+            let input_pubkey: PublicKey;
+            if let Some(_tweak) = input.sp_tweak {
+                // we could take the tweak and spend pubkey and calculate it, but since we're checking the proof below we just take the funding utxo
+                let funding_utxo = input.funding_utxo().unwrap();
+                // This is a p2tr output, we can take the pubkey from the script
+                if funding_utxo.script_pubkey.is_p2tr() {
+                    let taproot_output_key =
+                        XOnlyPublicKey::from_slice(&funding_utxo.script_pubkey.as_bytes()[2..])?;
+                    input_pubkey =
+                        PublicKey::from_x_only_public_key(taproot_output_key, Parity::Even);
+                } else {
+                    // This is not normal, return an error
+                    return Err(Error::Other(format!("Input {} is spending a silent payment output with a non-p2tr script pubkey", i)));
+                }
             } else {
-                None
+                // This is another eligible output, we rely on the bip32 derivation to get the pubkey
+                if !input.bip32_derivations.len() > 1 {
+                    return Err(Error::Other(format!(
+                        "Input {} has multiple bip32 derivations",
+                        i
+                    )));
+                }
+                let (pubkey, (_, _)) =
+                    input.bip32_derivations.iter().next().ok_or_else(|| {
+                        Error::Other(format!("Input {} missing bip32 derivation", i))
+                    })?;
+                input_pubkey = pubkey.inner;
             }
-        })
-        .collect()
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::psbt::core::utils::create_psbt;
-    use crate::psbt::core::PsbtInput;
-    use crate::psbt::roles::constructor::add_inputs;
-    use crate::psbt::roles::{add_ecdh_shares, add_outputs};
-    use crate::psbt::PsbtOutput;
-    use bitcoin::{hashes::Hash, Amount, OutPoint, ScriptBuf, Sequence, TxOut, Txid};
-    use secp256k1::SecretKey;
-    use silentpayments::{Network, SilentPaymentAddress};
+            // Then check that we have a ecdh share for that input, one for each silent payment in outputs
+            for key in &scan_keys {
+                let share =
+                    if let Some(share) = input.sp_ecdh_shares.get(&CompressedPublicKey(*key)) {
+                        share
+                    } else {
+                        return Err(Error::Other(format!(
+                            "Input {} missing ECDH share for scan key {:?}",
+                            i, key
+                        )));
+                    };
 
-    // #[test]
-    // fn test_add_ecdh_shares_full() {
-    //     let secp = Secp256k1::new();
-    //     let mut psbt = create_psbt(2, 1);
+                let proof =
+                    if let Some(proof) = input.sp_dleq_proofs.get(&CompressedPublicKey(*key)) {
+                        proof
+                    } else {
+                        return Err(Error::Other(format!(
+                            "Input {} missing DLEQ proof for scan key {:?}",
+                            i, key
+                        )));
+                    };
 
-    //     let privkey1 = SecretKey::from_slice(&[1u8; 32]).unwrap();
-    //     let privkey2 = SecretKey::from_slice(&[2u8; 32]).unwrap();
-    //     let scan_privkey = SecretKey::from_slice(&[3u8; 32]).unwrap();
-    //     let scan_key = PublicKey::from_secret_key(&secp, &scan_privkey);
+                // Check the proof is valid
+                let is_valid =
+                    dleq_verify_proof(secp, &input_pubkey, key, &share.0, proof, None)
+                        .map_err(|e| Error::Other(format!("DLEQ verification failed: {}", e)))?;
+                if !is_valid {
+                    return Err(Error::Other(format!(
+                        "Invalid proof for input {} and scan key {:?}",
+                        i, key
+                    )));
+                }
 
-    //     let inputs = vec![
-    //         PsbtInput::new(
-    //             0,
-    //             OutPoint::new(Txid::all_zeros(), 0),
-    //             TxOut {
-    //                 value: Amount::from_sat(50000),
-    //                 script_pubkey: ScriptBuf::new(),
-    //             },
-    //             Sequence::MAX,
-    //         ),
-    //         PsbtInput::new(
-    //             1,
-    //             OutPoint::new(Txid::all_zeros(), 1),
-    //             TxOut {
-    //                 value: Amount::from_sat(30000),
-    //                 script_pubkey: ScriptBuf::new(),
-    //             },
-    //             Sequence::MAX,
-    //         ),
-    //     ];
-
-    //     add_inputs(&mut psbt, &inputs).unwrap();
-    //     add_ecdh_shares_full(&secp, &mut psbt, &inputs, &[scan_key], true).unwrap();
-
-    //     // Verify ECDH shares were added
-    //     let shares0 = psbt.get_input_ecdh_shares(0);
-    //     assert_eq!(shares0.len(), 1);
-    //     assert_eq!(shares0[0].scan_key, scan_key);
-
-    //     let shares1 = psbt.get_input_ecdh_shares(1);
-    //     assert_eq!(shares1.len(), 1);
-    // }
-
-    #[test]
-    fn test_add_ecdh_shares_partial() {
-        let secp = Secp256k1::new();
-        let mut psbt = create_psbt(2, 1);
-
-        let privkey1 = SecretKey::from_slice(&[1u8; 32]).unwrap();
-        let privkey2 = SecretKey::from_slice(&[2u8; 32]).unwrap();
-        let scan_privkey = SecretKey::from_slice(&[3u8; 32]).unwrap();
-        let scan_pubkey = PublicKey::from_secret_key(&secp, &scan_privkey);
-        let spend_privkey = SecretKey::from_slice(&[4u8; 32]).unwrap();
-        let spend_pubkey = PublicKey::from_secret_key(&secp, &spend_privkey);
-
-        let inputs = vec![
-            PsbtInput::new(
-                OutPoint::new(Txid::all_zeros(), 0),
-                TxOut {
-                    value: Amount::from_sat(50000),
-                    script_pubkey: ScriptBuf::new(),
-                },
-                Sequence::MAX,
-            ),
-            PsbtInput::new(
-                OutPoint::new(Txid::all_zeros(), 1),
-                TxOut {
-                    value: Amount::from_sat(30000),
-                    script_pubkey: ScriptBuf::new(),
-                },
-                Sequence::MAX,
-            ),
-        ];
-
-        add_inputs(&mut psbt, &inputs).unwrap();
-
-        let outputs = vec![PsbtOutput::silent_payment(
-            Amount::from_sat(50000),
-            SilentPaymentAddress::new(
-                scan_pubkey,
-                spend_pubkey,
-                Network::Regtest,
-                silentpayments::SpVersion::ZERO,
-            ),
-            None,
-        )];
-        for (i, output) in outputs.iter().enumerate() {
-            add_outputs(&mut psbt, i, output).unwrap();
+                // We can add that share to the global map
+                global_ecdh_shares.get_mut(key).unwrap().push(share.0);
+            }
         }
 
-        // Only sign input 0
-        add_ecdh_shares(&secp, &mut psbt, &HashMap::from([(0, privkey1)]), false).unwrap();
+        for (scan_key, shares) in global_ecdh_shares.iter() {
+            let shares_ref: Vec<&PublicKey> = shares.iter().collect();
+            let combined_keys = PublicKey::combine_keys(&shares_ref)?;
+            self.global.sp_ecdh_shares.insert(
+                CompressedPublicKey(*scan_key),
+                CompressedPublicKey(combined_keys),
+            );
+        }
 
-        // Input 0 should have shares
-        let shares0 = psbt.get_input_ecdh_shares(0);
-        assert_eq!(shares0.len(), 1);
+        // TODO does adding up all the proofs make a valid proof for global?
 
-        // Input 1 should not have shares
-        let shares1 = psbt.get_input_ecdh_shares(1);
-        assert_eq!(shares1.len(), 0);
+        Ok(())
+    }
+
+    fn compute_sp_outputs(&mut self, secp: &Secp256k1<secp256k1::All>) -> Result<()> {
+        let network = silentpayments::Network::Mainnet; // We don't really care about the network, we'll see later
+
+        // We must add all the outpoints and use the sum to tweak each ecdh share
+        let mut generate_recipients_inputs: HashMap<PublicKey, GeneratePubkeysInput> =
+            HashMap::new();
+        for sp_output in self.outputs.iter().filter(|o| o.sp_v0_info.is_some()) {
+            let (scan_key, spend_key) = sp_output.get_sp_info().unwrap();
+            if let Some(input) = generate_recipients_inputs.get_mut(&scan_key) {
+                input.spend_keys.push(spend_key);
+            } else {
+                let share = self
+                    .global
+                    .sp_ecdh_shares
+                    .get(&CompressedPublicKey(scan_key))
+                    .ok_or_else(|| {
+                        Error::InvalidPsbtState(format!("Missing share for key {}", scan_key))
+                    })?;
+                let input = GeneratePubkeysInput {
+                    scan_key,
+                    ecdh_shared_secret: SharedSecret::<InputHashApplied>::from_inner(&share.0),
+                    spend_keys: vec![spend_key],
+                    sp_version: silentpayments::SpVersion::ZERO,
+                };
+                generate_recipients_inputs.insert(scan_key, input);
+            }
+        }
+        generate_recipient_pubkeys(
+            secp,
+            generate_recipients_inputs.into_values().collect(),
+            network,
+        )
+        .map_err(|e| Error::Other(e.to_string()))?;
+        Ok(())
+    }
+
+    fn sign_sp_inputs(
+        &mut self,
+        secp: &Secp256k1<secp256k1::All>,
+        spend_key: SecretKey
+    ) -> Result<()> {
+        let sp_inputs_idx: Vec<usize> = self.inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, input)| {
+                if let Some(_tweak) = input.sp_tweak {
+                    Some(i)
+                } else {
+                    // not a sp input
+                    None
+                }
+                // TODO must also check the bip32 pubkey to be sure that's our input
+            })
+            .collect();
+        for idx in sp_inputs_idx {
+            match self.sign_silent_payment_input(idx, spend_key, secp) {
+                Ok(_) => (),
+                Err(e) => log::debug!("Failed to sign input {}: {}", idx, e.to_string())
+            };
+        }
+        Ok(())
     }
 }

@@ -27,10 +27,7 @@ impl Bip375OutputConstructorExt for Output {
         None
     }
 
-    fn set_sp_info(
-        &mut self,
-        address: &SilentPaymentAddress,
-    ) -> Option<Vec<u8>> {
+    fn set_sp_info(&mut self, address: &SilentPaymentAddress) -> Option<Vec<u8>> {
         let old_info = self.sp_v0_info.clone();
         // PSBT_OUT_SP_V0_INFO contains only the keys (66 bytes)
         // Label is stored separately in PSBT_OUT_SP_V0_LABEL
@@ -52,5 +49,4 @@ impl Bip375OutputConstructorExt for Output {
 
         old_label
     }
-
 }

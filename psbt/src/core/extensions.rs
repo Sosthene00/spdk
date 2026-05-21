@@ -24,7 +24,10 @@
 //! - **Upstreamable**: Clean API that could be contributed to rust-psbt
 //! - **Type-safe**: Leverages Rust's type system for correctness
 
-use super::{error::{Error, Result}, EcdhShareData};
+use super::{
+    error::{Error, Result},
+    EcdhShareData,
+};
 use psbt_v2::{
     bitcoin::CompressedPublicKey,
     v2::{dleq::DleqProof, Psbt},
