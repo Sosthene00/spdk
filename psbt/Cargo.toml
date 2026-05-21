@@ -25,3 +25,4 @@ rust-dleq.workspace = true
 rand.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+log.workspace = true
