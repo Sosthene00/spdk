@@ -14,9 +14,9 @@ use crate::crypto::{dleq_generate_proof, dleq_verify_proof, sign_p2tr_input};
 use crate::roles::Bip375OutputConstructorExt;
 use bitcoin::sighash::SighashCache;
 use bitcoin::{key::TapTweak, CompressedPublicKey};
-use bitcoin::{PrivateKey, ScriptBuf, Witness, XOnlyPublicKey};
+use bitcoin::{PrivateKey, ScriptBuf, Transaction, Witness, XOnlyPublicKey};
 use futures::future::Shared;
-use psbt_v2::v2::{Input, Signer};
+use psbt_v2::v2::{Extractor, Input, Signer};
 use rand::RngCore;
 use secp256k1::{Parity, PublicKey, Scalar, Secp256k1, SecretKey};
 use silentpayments::sending::{generate_recipient_pubkeys, GeneratePubkeysInput};
@@ -220,6 +220,7 @@ pub trait SignerPsbtExt {
     fn compute_sp_outputs(&mut self, secp: &Secp256k1<secp256k1::All>) -> Result<()>;
     fn sign_sp_inputs(&mut self, secp: &Secp256k1<secp256k1::All>, spend_key: SecretKey) -> Result<()>;
     fn finalize(&mut self) -> Result<()>;
+    fn extract_tx(self) -> Result<Transaction>;
 }
 
 impl SignerPsbtExt for Psbt {
@@ -406,5 +407,13 @@ impl SignerPsbtExt for Psbt {
             }
         }
         Ok(())
+    }
+
+    fn extract_tx(self) -> Result<Transaction> {
+        let extract_tx = Extractor::new(self)
+            .map_err(|e| Error::InvalidPsbtState(format!("Psbt not finalized")))?
+            .extract_tx()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        Ok(extract_tx)
     }
 }
