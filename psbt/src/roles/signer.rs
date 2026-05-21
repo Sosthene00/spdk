@@ -9,216 +9,35 @@
 
 use std::collections::HashMap;
 
-use crate::core::{utils::is_input_eligible, Bip375PsbtExt, EcdhShareData, Error, Psbt, Result};
-use crate::crypto::{dleq_generate_proof, dleq_verify_proof, sign_p2tr_input};
+use crate::core::{utils::is_input_eligible, Error, Psbt, Result};
+use crate::crypto::dleq_verify_proof;
 use crate::roles::Bip375OutputConstructorExt;
-use bitcoin::sighash::SighashCache;
-use bitcoin::{key::TapTweak, CompressedPublicKey};
-use bitcoin::{PrivateKey, ScriptBuf, Transaction, Witness, XOnlyPublicKey};
-use futures::future::Shared;
-use psbt_v2::v2::{Extractor, Input, Signer};
-use rand::RngCore;
-use secp256k1::{Parity, PublicKey, Scalar, Secp256k1, SecretKey};
+use bitcoin::key::TweakedPublicKey;
+use bitcoin::CompressedPublicKey;
+use bitcoin::{ScriptBuf, Transaction, Witness, XOnlyPublicKey};
+use psbt_v2::v2::Extractor;
+use secp256k1::{Parity, PublicKey, Secp256k1, SecretKey};
 use silentpayments::sending::{generate_recipient_pubkeys, GeneratePubkeysInput};
-use silentpayments::utils::common::{InputHashApplied, SharedSecret};
-use silentpayments::utils::receiving::get_pubkey_from_input;
-use silentpayments::utils::{common::Raw, sending::TypedSecretKey};
-
-// pub fn add_input_ecdh_share(
-//     secp: &Secp256k1<secp256k1::All>,
-//     psbt: &mut Psbt,
-//     input_index: usize,
-//     private_key: SecretKey,
-//     include_dleq: bool,
-// ) -> Result<()> {
-//     for
-
-//     if scan_keys.is_empty() {
-//         return Err(Error::Other("No silent payment outputs".to_string()));
-//     }
-
-//     let input = psbt
-//         .inputs
-//         .get_mut(input_index)
-//         .ok_or(Error::InvalidInputIndex(input_index))?;
-
-//     let funding_utxo = input
-//         .funding_utxo()
-//         .map_err(|_| Error::InvalidInputIndex(input_index))?;
-
-//     // Check that the utxo is eligible for silent payments
-//     match is_input_eligible(input) {
-//         Ok(false) => {
-//             return Err(Error::Other(
-//                 "Input is not eligible for silent payments".to_string(),
-//             ))
-//         }
-//         Ok(true) => (),
-//         Err(e) => return Err(e), // likely we don't have the funding utxo yet
-//     }
-
-//     let is_taproot = funding_utxo.script_pubkey.is_p2tr();
-
-//     // BIP-352: for taproot inputs whose pubkey has odd y, negate the key
-//     // so the ECDH share is consistent with the x-only (even-y) convention.
-//     let normalized_privkey =
-//         TypedSecretKey::<Raw>::new(private_key).normalize_for_input(secp, is_taproot);
-
-//     // Check that the provided private key matches the key spent
-//     // We need the *_IN_DERIVATION fields set
-//     let pubkey = bitcoin::PublicKey::from(normalized_privkey.as_inner().public_key(secp));
-//     let has_any_bip32_derivations = !input.bip32_derivations.is_empty();
-//     let private_key_matches_bip32_derivation = input.bip32_derivations.contains_key(&pubkey);
-//     let compressed_pubkey =
-//         CompressedPublicKey::try_from(pubkey).map_err(|_| Error::InvalidPublicKey)?;
-//     let has_any_sp_spend_bip32_derivations = !input.sp_spend_bip32_derivations.is_empty();
-//     let private_key_matches_sp_spend_bip32_derivation = input
-//         .sp_spend_bip32_derivations
-//         .contains_key(&compressed_pubkey);
-
-//     if has_any_bip32_derivations && has_any_sp_spend_bip32_derivations {
-//         return Err(Error::InvalidPsbtState(
-//             "input cannot use both bip32_derivations and sp_spend_bip32_derivations".to_string(),
-//         ));
-//     }
-
-//     if has_any_sp_spend_bip32_derivations && !is_taproot {
-//         return Err(Error::InvalidPsbtState(
-//             "sp_spend_bip32_derivations is only valid for taproot inputs".to_string(),
-//         ));
-//     }
-
-//     if !private_key_matches_bip32_derivation && !private_key_matches_sp_spend_bip32_derivation {
-//         return Err(Error::InvalidPsbtState(
-//             "private key does not match any registered input derivation key (missing derivations or wrong private key)".to_string(),
-//         ));
-//     }
-
-//     for scan_key in &scan_keys {
-//         let ecdh_shared_secret: SharedSecret<Raw> =
-//             normalized_privkey.calculate_ecdh_shared_secret(scan_key);
-
-//         let dleq_proof = if include_dleq {
-//             let mut rand_aux = [0u8; 32];
-//             rand::thread_rng().fill_bytes(&mut rand_aux);
-//             Some(
-//                 dleq_generate_proof(
-//                     secp,
-//                     normalized_privkey.as_inner(),
-//                     scan_key,
-//                     &rand_aux,
-//                     None,
-//                 )
-//                 .map_err(|e| Error::Other(format!("DLEQ generation failed: {}", e)))?,
-//             )
-//         } else {
-//             None
-//         };
-
-//         let compressed_scan_key =
-//             CompressedPublicKey::try_from(bitcoin::PublicKey::from(*scan_key))
-//                 .map_err(|_| Error::InvalidPublicKey)?;
-//         let compressed_shared_secret = CompressedPublicKey::try_from(bitcoin::PublicKey::from(
-//             ecdh_shared_secret.into_inner(),
-//         ))
-//         .map_err(|_| Error::InvalidPublicKey)?;
-
-//         input
-//             .sp_ecdh_shares
-//             .insert(compressed_scan_key, compressed_shared_secret);
-
-//         if let Some(proof) = dleq_proof {
-//             input.sp_dleq_proofs.insert(compressed_scan_key, proof);
-//         }
-//     }
-//     Ok(())
-// }
-// /// Add ECDH shares for all inputs (full signing)
-// pub fn add_ecdh_shares_full(
-//     secp: &Secp256k1<secp256k1::All>,
-//     psbt: &mut Psbt,
-//     inputs: &[PsbtInput],
-//     scan_keys: &[PublicKey],
-//     include_dleq: bool,
-// ) -> Result<()> {
-//     for (input_idx, input) in inputs.iter().enumerate() {
-//         let Some(ref privkey) = input.private_key else {
-//             return Err(Error::Other(format!(
-//                 "Input {} missing private key",
-//                 input_idx
-//             )));
-//         };
-
-//         for scan_key in scan_keys {
-//             let share_point = compute_ecdh_share(secp, privkey, scan_key)
-//                 .map_err(|e| Error::Other(format!("ECDH computation failed: {}", e)))?;
-
-//             let dleq_proof = if include_dleq {
-//                 let mut rand_aux = [0u8; 32];
-//                 rand::thread_rng().fill_bytes(&mut rand_aux);
-//                 Some(
-//                     dleq_generate_proof(secp, privkey, scan_key, &rand_aux, None)
-//                         .map_err(|e| Error::Other(format!("DLEQ generation failed: {}", e)))?,
-//                 )
-//             } else {
-//                 None
-//             };
-
-//             let ecdh_share = EcdhShareData::new(*scan_key, share_point, dleq_proof);
-//             psbt.add_input_ecdh_share(input_idx, &ecdh_share)?;
-//         }
-//     }
-//     Ok(())
-// }
-
-// pub fn add_ecdh_shares_partial(
-//     secp: &Secp256k1<secp256k1::All>,
-//     psbt: &mut Psbt,
-//     inputs: &[PsbtInput],
-//     scan_keys: &[PublicKey],
-//     controlled_indices: &[usize],
-//     include_dleq: bool,
-// ) -> Result<()> {
-//     let controlled_set: HashSet<usize> = controlled_indices.iter().copied().collect();
-
-//     for (input_idx, input) in inputs.iter().enumerate() {
-//         if !controlled_set.contains(&input_idx) {
-//             continue;
-//         }
-
-//         let Some(ref base_privkey) = input.private_key else {
-//             return Err(Error::Other(format!(
-//                 "Controlled input {} missing private key",
-//                 input_idx
-//             )));
-//         };
-
-//         for scan_key in scan_keys {
-//             let share_point = compute_ecdh_share(secp, base_privkey, scan_key)
-//                 .map_err(|e| Error::Other(format!("ECDH computation failed: {}", e)))?;
-
-//             let dleq_proof = if include_dleq {
-//                 let mut rand_aux = [0u8; 32];
-//                 rand::thread_rng().fill_bytes(&mut rand_aux);
-//                 Some(
-//                     dleq_generate_proof(secp, base_privkey, scan_key, &rand_aux, None)
-//                         .map_err(|e| Error::Other(format!("DLEQ generation failed: {}", e)))?,
-//                 )
-//             } else {
-//                 None
-//             };
-
-//             let ecdh_share = EcdhShareData::new(*scan_key, share_point, dleq_proof);
-//             psbt.add_input_ecdh_share(input_idx, &ecdh_share)?;
-//         }
-//     }
-//     Ok(())
-// }
+use silentpayments::utils::common::{
+    InputHashApplied, SharedSecret, SILENT_PAYMENT_ADDRESS_BYTE_LEN,
+};
+use silentpayments::SpVersion;
 
 pub trait SignerPsbtExt {
     fn aggregate_ecdh_shares(&mut self, secp: &Secp256k1<secp256k1::All>) -> Result<()>;
-    fn compute_sp_outputs(&mut self, secp: &Secp256k1<secp256k1::All>) -> Result<()>;
-    fn sign_sp_inputs(&mut self, secp: &Secp256k1<secp256k1::All>, spend_key: SecretKey) -> Result<()>;
+    fn compute_sp_outputs(
+        &self,
+        secp: &Secp256k1<secp256k1::All>,
+    ) -> Result<HashMap<[u8; SILENT_PAYMENT_ADDRESS_BYTE_LEN], Vec<XOnlyPublicKey>>>;
+    fn set_sp_scriptpubkey(
+        &mut self,
+        xonly_map: HashMap<[u8; SILENT_PAYMENT_ADDRESS_BYTE_LEN], Vec<XOnlyPublicKey>>,
+    ) -> Result<()>;
+    fn sign_sp_inputs(
+        &mut self,
+        secp: &Secp256k1<secp256k1::All>,
+        spend_key: SecretKey,
+    ) -> Result<()>;
     fn finalize(&mut self) -> Result<()>;
     fn extract_tx(self) -> Result<Transaction>;
 }
@@ -329,9 +148,10 @@ impl SignerPsbtExt for Psbt {
         Ok(())
     }
 
-    fn compute_sp_outputs(&mut self, secp: &Secp256k1<secp256k1::All>) -> Result<()> {
-        let network = silentpayments::Network::Mainnet; // We don't really care about the network, we'll see later
-
+    fn compute_sp_outputs(
+        &self,
+        secp: &Secp256k1<secp256k1::All>,
+    ) -> Result<HashMap<[u8; SILENT_PAYMENT_ADDRESS_BYTE_LEN], Vec<XOnlyPublicKey>>> {
         // We must add all the outpoints and use the sum to tweak each ecdh share
         let mut generate_recipients_inputs: HashMap<PublicKey, GeneratePubkeysInput> =
             HashMap::new();
@@ -356,21 +176,67 @@ impl SignerPsbtExt for Psbt {
                 generate_recipients_inputs.insert(scan_key, input);
             }
         }
-        generate_recipient_pubkeys(
-            secp,
-            generate_recipients_inputs.into_values().collect(),
-            network,
-        )
-        .map_err(|e| Error::Other(e.to_string()))?;
+        let res_map =
+            generate_recipient_pubkeys(secp, generate_recipients_inputs.into_values().collect())
+                .map_err(|e| Error::Other(e.to_string()))?;
+        Ok(res_map)
+    }
+
+    fn set_sp_scriptpubkey(
+        &mut self,
+        mut xonly_map: HashMap<[u8; SILENT_PAYMENT_ADDRESS_BYTE_LEN], Vec<XOnlyPublicKey>>,
+    ) -> Result<()> {
+        let mut update_outputs = self.outputs.clone();
+        for output in update_outputs.iter_mut() {
+            if let Some(sp_info) = output.sp_v0_info.as_ref() {
+                // Find the matching pubkey
+                let mut key = [SpVersion::ZERO.into(); SILENT_PAYMENT_ADDRESS_BYTE_LEN];
+                key[1..34].copy_from_slice(&sp_info.as_slice()[..33]);
+                key[34..].copy_from_slice(&sp_info.as_slice()[33..]);
+                if let Some(xonly_keys) = xonly_map.get_mut(&key) {
+                    if xonly_keys.is_empty() {
+                        return Err(Error::Other(format!("Not enough keys")));
+                    };
+                    let xonly_key = xonly_keys.remove(0);
+                    let tweaked = TweakedPublicKey::dangerous_assume_tweaked(xonly_key);
+                    let script = ScriptBuf::new_p2tr_tweaked(tweaked);
+                    output.script_pubkey = script;
+                } else {
+                    return Err(Error::InvalidPsbtState(format!(
+                        "sp_info {:?} doesn't exit in provided map",
+                        key
+                    )));
+                }
+            } else {
+                // not a sp output
+                continue;
+            }
+        }
+        // Check that we used all provided key
+        for (_address, xonly_keys) in xonly_map {
+            if !xonly_keys.is_empty() {
+                return Err(Error::InvalidPsbtState(format!(
+                    "Failed to use all provided keys"
+                )));
+            }
+        }
+
+        // Now replace the initial outputs
+        self.outputs = update_outputs;
+
+        // Make the psbt non modifiable
+        self.global.tx_modifiable_flags = 0u8;
+
         Ok(())
     }
 
     fn sign_sp_inputs(
         &mut self,
         secp: &Secp256k1<secp256k1::All>,
-        spend_key: SecretKey
+        spend_key: SecretKey,
     ) -> Result<()> {
-        let sp_inputs_idx: Vec<usize> = self.inputs
+        let sp_inputs_idx: Vec<usize> = self
+            .inputs
             .iter()
             .enumerate()
             .filter_map(|(i, input)| {
@@ -386,7 +252,7 @@ impl SignerPsbtExt for Psbt {
         for idx in sp_inputs_idx {
             match self.sign_silent_payment_input(idx, spend_key, secp) {
                 Ok(_) => (),
-                Err(e) => log::debug!("Failed to sign input {}: {}", idx, e.to_string())
+                Err(e) => log::debug!("Failed to sign input {}: {}", idx, e.to_string()),
             };
         }
         Ok(())
@@ -403,7 +269,10 @@ impl SignerPsbtExt for Psbt {
                 input.sighash_type = None;
             } else {
                 // We can't finalize a partially signed transaction
-                return Err(Error::InvalidPsbtState(format!("Missing signature on input {}", i)));
+                return Err(Error::InvalidPsbtState(format!(
+                    "Missing signature on input {}",
+                    i
+                )));
             }
         }
         Ok(())
