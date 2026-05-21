@@ -111,7 +111,7 @@ mod tests {
                     inputs.push(input);
                 }
             }
-            let outputs = generate_recipient_pubkeys(&secp, inputs, NETWORK).unwrap();
+            let outputs = generate_recipient_pubkeys(&secp, inputs).unwrap();
             assert_ne!(outputs.len(), 0);
 
             for output_pubkeys in &outputs {

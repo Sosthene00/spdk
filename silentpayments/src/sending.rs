@@ -13,12 +13,10 @@ use secp256k1::Signing;
 use secp256k1::{PublicKey, Secp256k1, XOnlyPublicKey};
 use std::collections::HashMap;
 
-use crate::utils::common::calculate_t_n;
 use crate::utils::common::SpVersion;
+use crate::utils::common::{calculate_t_n, SILENT_PAYMENT_ADDRESS_BYTE_LEN};
 use crate::utils::common::{InputHashApplied, SharedSecret};
-use crate::Network;
 use crate::Result;
-use crate::SilentPaymentAddress;
 
 #[derive(Debug)]
 pub struct GeneratePubkeysInput {
@@ -39,12 +37,10 @@ pub struct GeneratePubkeysInput {
 /// * `inputs` - A collection of [`GeneratePubkeysInput`] values. Each value
 ///   provides the recipient scan key, ECDH shared secret, spend keys, and
 ///   silent payment version used for derivation.
-/// * `network` - The target Bitcoin network used when constructing
-///   [`SilentPaymentAddress`] values.
 ///
 /// # Returns
 ///
-/// Returns a [`HashMap`] from [`SilentPaymentAddress`] to derived output
+/// Returns a [`HashMap`] from [`[u8: 67]`] (serialization of version, scan_key, spend_key) to derived output
 /// [`XOnlyPublicKey`] values for that address.
 ///
 /// # Errors
@@ -55,21 +51,23 @@ pub struct GeneratePubkeysInput {
 pub fn generate_recipient_pubkeys<C: Signing>(
     secp: &Secp256k1<C>,
     inputs: Vec<GeneratePubkeysInput>,
-    network: Network,
-) -> Result<HashMap<SilentPaymentAddress, Vec<XOnlyPublicKey>>> {
-    let mut result: HashMap<SilentPaymentAddress, Vec<XOnlyPublicKey>> = HashMap::new();
+) -> Result<HashMap<[u8; SILENT_PAYMENT_ADDRESS_BYTE_LEN], Vec<XOnlyPublicKey>>> {
+    let mut result: HashMap<[u8; SILENT_PAYMENT_ADDRESS_BYTE_LEN], Vec<XOnlyPublicKey>> =
+        HashMap::new();
     for input in inputs {
         let ecdh_shared_secret = &input.ecdh_shared_secret;
         let mut k = 0;
         for spend_key in input.spend_keys {
-            let address =
-                SilentPaymentAddress::new(input.scan_key, spend_key, network, input.sp_version);
             let t_n = calculate_t_n(ecdh_shared_secret, k)?;
             let res = t_n.public_key(secp);
-            let reskey = res.combine(&address.get_spend_key())?;
+            let reskey = res.combine(&spend_key)?;
             let (reskey_xonly, _) = reskey.x_only_public_key();
 
-            let entry = result.entry(address.into()).or_default();
+            let mut key = [0u8; SILENT_PAYMENT_ADDRESS_BYTE_LEN];
+            key[0] = input.sp_version.into();
+            key[1..34].copy_from_slice(&input.scan_key.serialize());
+            key[34..].copy_from_slice(&spend_key.serialize());
+            let entry = result.entry(key).or_default();
             entry.push(reskey_xonly);
             k += 1;
         }
