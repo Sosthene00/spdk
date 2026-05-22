@@ -5,32 +5,26 @@ use bdk_coin_select::{
     Candidate, ChangePolicy, CoinSelector, DrainWeights, TR_DUST_RELAY_MIN_VALUE, Target,
     TargetFee, TargetOutputs,
 };
-use bitcoin::absolute::LockTime;
 use bitcoin::consensus::serialize;
-use bitcoin::hashes::Hash;
 use bitcoin::key::TapTweak;
 use bitcoin::script::PushBytesBuf;
 use bitcoin::secp256k1::rand::seq::SliceRandom;
-use bitcoin::secp256k1::{Keypair, Message, Secp256k1, rand};
-use bitcoin::sighash::{Prevouts, SighashCache};
-use bitcoin::taproot::Signature;
-use bitcoin::transaction::Version;
+use bitcoin::secp256k1::{Secp256k1, SecretKey, rand};
 use bitcoin::{
-    Amount, Network, OutPoint, ScriptBuf, TapLeafHash, Transaction, TxIn, TxOut, Witness,
+    Amount, Network, OutPoint, ScriptBuf, TxOut,
 };
 use psbt::Psbt;
 use psbt::core::{Input, Output};
 use psbt::roles::Bip375OutputConstructorExt;
 use psbt_v2::v2::{Constructor, Creator, Modifiable};
-use silentpayments::sending::GeneratePubkeysInput;
 use silentpayments::utils::sending::TypedSecretKey;
-use silentpayments::{Network as SpNetwork, SilentPaymentAddress, utils::common::InputHashApplied};
-use silentpayments::{SpVersion, utils as sp_utils};
+use silentpayments::{Network as SpNetwork, utils::common::InputHashApplied};
+use silentpayments::utils as sp_utils;
 
 use spdk_core::constants::{DATA_CARRIER_SIZE, NUMS};
 use spdk_core::updater::DiscoveredOutput;
 
-use super::{FeeRate, Recipient, RecipientAddress, SilentPaymentUnsignedTransaction, SpClient};
+use super::{FeeRate, Recipient, RecipientAddress, SpClient};
 
 impl SpClient {
     // For now it's only suitable for wallet that spends only silent payments outputs that it owns
@@ -317,93 +311,14 @@ impl SpClient {
         Ok(constructor.psbt()?)
     }
 
-    fn taproot_sighash<
-        T: std::ops::Deref<Target = Transaction> + std::borrow::Borrow<Transaction>,
-    >(
-        hash_ty: bitcoin::TapSighashType,
-        prevouts: &[TxOut],
-        input_index: usize,
-        cache: &mut SighashCache<T>,
-        tapleaf_hash: Option<TapLeafHash>,
-    ) -> Result<Message, Error> {
-        let prevouts = Prevouts::All(prevouts);
-
-        let sighash = match tapleaf_hash {
-            Some(leaf_hash) => cache.taproot_script_spend_signature_hash(
-                input_index,
-                &prevouts,
-                leaf_hash,
-                hash_ty,
-            )?,
-            None => cache.taproot_key_spend_signature_hash(input_index, &prevouts, hash_ty)?,
-        };
-        let msg = Message::from_digest(sighash.to_byte_array());
-        Ok(msg)
-    }
-
     pub fn sign_transaction(
         &self,
-        unsigned_tx: SilentPaymentUnsignedTransaction,
-        aux_rand: &[u8; 32],
-    ) -> Result<Transaction> {
-        // TODO check that we have aux_rand, at least that it's not all `0`s
-        let b_spend = self.try_get_secret_spend_key()?;
-
-        let to_sign = match unsigned_tx.unsigned_tx.as_ref() {
-            Some(tx) => tx,
-            None => return Err(Error::msg("Missing unsigned transaction")),
-        };
-
-        let mut signed = to_sign.clone();
-
-        let mut cache = SighashCache::new(to_sign);
-
-        let prevouts: Vec<_> = unsigned_tx
-            .selected_utxos
-            .iter()
-            .map(|(_, output)| TxOut {
-                value: output.value,
-                script_pubkey: output.script_pubkey.clone(),
-            })
-            .collect();
-
-        let secp = Secp256k1::signing_only();
-        let sighash_type = bitcoin::TapSighashType::Default; // We impose Default for now
-
-        for (i, input) in to_sign.input.iter().enumerate() {
-            let tap_leaf_hash: Option<TapLeafHash> = None;
-
-            let msg = Self::taproot_sighash(sighash_type, &prevouts, i, &mut cache, tap_leaf_hash)?;
-
-            // Construct the signing key
-            let (_, owned_output) = unsigned_tx
-                .selected_utxos
-                .iter()
-                .find(|(outpoint, _)| *outpoint == input.previous_output)
-                .ok_or(Error::msg(format!(
-                    "prevout for output {} not in selected utxos",
-                    i
-                )))?;
-
-            let sk = b_spend.add_tweak(&owned_output.tweak)?;
-
-            let keypair = Keypair::from_secret_key(&secp, &sk);
-
-            let signature = secp.sign_schnorr_with_aux_rand(&msg, &keypair, aux_rand);
-
-            let mut witness = Witness::new();
-            witness.push(
-                Signature {
-                    signature,
-                    sighash_type,
-                }
-                .to_vec(),
-            );
-
-            signed.input[i].witness = witness;
-        }
-
-        Ok(signed)
+        mut psbt: Psbt,
+    ) -> Result<Psbt> {
+        let k: SecretKey = self.get_spend_key().try_into()?;
+        let secp = Secp256k1::new();
+        let _xonly_keys = psbt.sign_silent_payment_inputs(&k, &secp);
+        Ok(psbt)
     }
 
     pub fn get_partial_secret_for_selected_utxos(

@@ -37,7 +37,7 @@ pub trait SignerPsbtExt {
         &mut self,
         secp: &Secp256k1<secp256k1::All>,
         spend_key: SecretKey,
-    ) -> Result<()>;
+    ) -> Result<Vec<XOnlyPublicKey>>;
     fn finalize(&mut self) -> Result<()>;
     fn extract_tx(self) -> Result<Transaction>;
 }
@@ -234,28 +234,10 @@ impl SignerPsbtExt for Psbt {
         &mut self,
         secp: &Secp256k1<secp256k1::All>,
         spend_key: SecretKey,
-    ) -> Result<()> {
-        let sp_inputs_idx: Vec<usize> = self
-            .inputs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, input)| {
-                if let Some(_tweak) = input.sp_tweak {
-                    Some(i)
-                } else {
-                    // not a sp input
-                    None
-                }
-                // TODO must also check the bip32 pubkey to be sure that's our input
-            })
-            .collect();
-        for idx in sp_inputs_idx {
-            match self.sign_silent_payment_input(idx, spend_key, secp) {
-                Ok(_) => (),
-                Err(e) => log::debug!("Failed to sign input {}: {}", idx, e.to_string()),
-            };
-        }
-        Ok(())
+    ) -> Result<Vec<XOnlyPublicKey>> {
+        let signed_xonly_keys = self.sign_silent_payment_inputs(&spend_key, secp)
+            .map_err(|e| Error::Other(e.to_string()))?;
+        Ok(signed_xonly_keys)
     }
 
     fn finalize(&mut self) -> Result<()> {
