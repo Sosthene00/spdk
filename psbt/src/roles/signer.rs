@@ -84,7 +84,7 @@ impl SignerPsbtExt for Psbt {
                 }
             } else {
                 // This is another eligible output, we rely on the bip32 derivation to get the pubkey
-                if !input.bip32_derivations.len() > 1 {
+                if input.bip32_derivations.len() > 1 {
                     return Err(Error::Other(format!(
                         "Input {} has multiple bip32 derivations",
                         i
