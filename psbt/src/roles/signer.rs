@@ -12,14 +12,15 @@ use std::collections::HashMap;
 use crate::core::{utils::is_input_eligible, Error, Psbt, Result};
 use crate::crypto::dleq_verify_proof;
 use crate::roles::Bip375OutputConstructorExt;
+use bitcoin::consensus::serialize;
 use bitcoin::key::TweakedPublicKey;
-use bitcoin::CompressedPublicKey;
+use bitcoin::{CompressedPublicKey, OutPoint};
 use bitcoin::{ScriptBuf, Transaction, Witness, XOnlyPublicKey};
 use psbt_v2::v2::Extractor;
 use secp256k1::{Parity, PublicKey, Secp256k1, SecretKey};
 use silentpayments::sending::{generate_recipient_pubkeys, GeneratePubkeysInput};
 use silentpayments::utils::common::{
-    InputHashApplied, SharedSecret, SILENT_PAYMENT_ADDRESS_BYTE_LEN,
+    InputHashApplied, Raw, SILENT_PAYMENT_ADDRESS_BYTE_LEN, SharedSecret
 };
 use silentpayments::SpVersion;
 
@@ -134,12 +135,26 @@ impl SignerPsbtExt for Psbt {
             }
         }
 
+        let outpoints: Vec<[u8; 36]> = self
+            .inputs
+            .iter()
+            .map(|input| {
+                serialize(&OutPoint::new(input.previous_txid, input.spent_output_index))
+                    .try_into()
+                    .expect("OutPoint is 36 bytes long")
+            })
+            .collect();
+
+        let (outpoints_head, outpoints_tail) = outpoints.split_first().expect("At least one input");
+
         for (scan_key, shares) in global_ecdh_shares.iter() {
             let shares_ref: Vec<&PublicKey> = shares.iter().collect();
             let combined_keys = PublicKey::combine_keys(&shares_ref)?;
+            let input_hash_applied = SharedSecret::<Raw>::from_inner(&combined_keys).apply_input_hash(secp, &outpoints_head, &outpoints_tail)
+                .map_err(|e| Error::Other(format!("Failed to apply input hash: {}", e)))?;
             self.global.sp_ecdh_shares.insert(
                 CompressedPublicKey(*scan_key),
-                CompressedPublicKey(combined_keys),
+                CompressedPublicKey(input_hash_applied.into_inner()),
             );
         }
 
