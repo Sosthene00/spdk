@@ -60,6 +60,7 @@ impl SignerPsbtExt for Psbt {
         let mut global_ecdh_shares: HashMap<PublicKey, Vec<PublicKey>> =
             scan_keys.iter().map(|key| (*key, Vec::new())).collect();
 
+        let mut input_pubkeys: Vec<PublicKey> = Vec::new();
         for (i, input) in self.inputs.iter_mut().enumerate() {
             // First check that we're spending a silent payment eligible output
             if !is_input_eligible(&input)? {
@@ -133,6 +134,8 @@ impl SignerPsbtExt for Psbt {
                 // We can add that share to the global map
                 global_ecdh_shares.get_mut(key).unwrap().push(share.0);
             }
+
+            input_pubkeys.push(input_pubkey);
         }
 
         let outpoints: Vec<[u8; 36]> = self
@@ -147,10 +150,12 @@ impl SignerPsbtExt for Psbt {
 
         let (outpoints_head, outpoints_tail) = outpoints.split_first().expect("At least one input");
 
+        let pubkeys_sum = PublicKey::combine_keys(input_pubkeys.iter().collect::<Vec<&PublicKey>>().as_slice())?;
+
         for (scan_key, shares) in global_ecdh_shares.iter() {
             let shares_ref: Vec<&PublicKey> = shares.iter().collect();
             let combined_keys = PublicKey::combine_keys(&shares_ref)?;
-            let input_hash_applied = SharedSecret::<Raw>::from_inner(&combined_keys).apply_input_hash(secp, &outpoints_head, &outpoints_tail)
+            let input_hash_applied = SharedSecret::<Raw>::from_inner(&combined_keys).apply_input_hash(secp, &pubkeys_sum, &outpoints_head, &outpoints_tail)
                 .map_err(|e| Error::Other(format!("Failed to apply input hash: {}", e)))?;
             self.global.sp_ecdh_shares.insert(
                 CompressedPublicKey(*scan_key),

@@ -151,10 +151,10 @@ impl SharedSecret<Raw> {
     pub fn apply_input_hash<C: Verification>(
         self,
         secp: &Secp256k1<C>,
+        A_sum: &PublicKey,
         outpoints_head: &[u8; 36],
         outpoints_tail: &[[u8; 36]],
     ) -> Result<SharedSecret<InputHashApplied>> {
-        let A_sum: &PublicKey = self.as_inner();
         let input_hash = calculate_input_hash(outpoints_head, outpoints_tail, A_sum);
         let tweaked_key = self.into_inner().mul_tweak(secp, &input_hash)?;
         Ok(SharedSecret::<InputHashApplied>::from_inner(&tweaked_key))
