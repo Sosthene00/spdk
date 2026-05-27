@@ -18,17 +18,15 @@
 //!   - Conflict detection for same-field different-value scenarios
 
 pub mod constructor;
-// pub mod extractor;
-// pub mod input_finalizer;
-// pub mod input_witness_finalizer;
+pub mod extractor;
+pub mod input_witness_finalizer;
 pub mod signer;
 pub mod updater;
 // pub mod validation;
 
 pub use constructor::*;
-// pub use extractor::*;
-// pub use input_finalizer::*;
-// pub use input_witness_finalizer::*;
+pub use extractor::*;
+pub use input_witness_finalizer::*;
 pub use signer::*;
 pub use updater::*;
 // pub use validation::*;

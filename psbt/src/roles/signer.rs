@@ -15,8 +15,7 @@ use crate::roles::Bip375OutputConstructorExt;
 use bitcoin::consensus::serialize;
 use bitcoin::key::TweakedPublicKey;
 use bitcoin::{CompressedPublicKey, OutPoint};
-use bitcoin::{ScriptBuf, Transaction, Witness, XOnlyPublicKey};
-use psbt_v2::v2::Extractor;
+use bitcoin::{ScriptBuf, XOnlyPublicKey};
 use secp256k1::{Parity, PublicKey, Secp256k1, SecretKey};
 use silentpayments::sending::{generate_recipient_pubkeys, GeneratePubkeysInput};
 use silentpayments::utils::common::{
@@ -39,8 +38,6 @@ pub trait SignerPsbtExt {
         secp: &Secp256k1<secp256k1::All>,
         spend_key: SecretKey,
     ) -> Result<Vec<XOnlyPublicKey>>;
-    fn finalize(&mut self) -> Result<()>;
-    fn extract_tx(self) -> Result<Transaction>;
 }
 
 impl SignerPsbtExt for Psbt {
@@ -258,33 +255,5 @@ impl SignerPsbtExt for Psbt {
         let signed_xonly_keys = self.sign_silent_payment_inputs(&spend_key, secp)
             .map_err(|e| Error::Other(e.to_string()))?;
         Ok(signed_xonly_keys)
-    }
-
-    fn finalize(&mut self) -> Result<()> {
-        for (i, input) in self.inputs.iter_mut().enumerate() {
-            if let Some(sig) = input.tap_key_sig {
-                let mut witness = Witness::new();
-                witness.push(sig.to_vec());
-                input.final_script_sig = Some(ScriptBuf::new());
-                input.final_script_witness = Some(witness);
-                input.tap_key_sig = None;
-                input.sighash_type = None;
-            } else {
-                // We can't finalize a partially signed transaction
-                return Err(Error::InvalidPsbtState(format!(
-                    "Missing signature on input {}",
-                    i
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    fn extract_tx(self) -> Result<Transaction> {
-        let extract_tx = Extractor::new(self)
-            .map_err(|e| Error::InvalidPsbtState(format!("Psbt not finalized")))?
-            .extract_tx()
-            .map_err(|e| Error::Other(e.to_string()))?;
-        Ok(extract_tx)
     }
 }
