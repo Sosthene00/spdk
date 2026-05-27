@@ -156,7 +156,7 @@ impl SharedSecret<Raw> {
     ) -> Result<SharedSecret<InputHashApplied>> {
         let A_sum: &PublicKey = self.as_inner();
         let input_hash = calculate_input_hash(outpoints_head, outpoints_tail, A_sum);
-        let tweaked_key = self.into_inner().add_exp_tweak(secp, &input_hash)?;
+        let tweaked_key = self.into_inner().mul_tweak(secp, &input_hash)?;
         Ok(SharedSecret::<InputHashApplied>::from_inner(&tweaked_key))
     }
 }
