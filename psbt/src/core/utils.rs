@@ -1,6 +1,5 @@
-use bitcoin::hashes::Hash;
-use bitcoin::{OutPoint, Script, TxOut, Txid};
-use psbt_v2::v2::{Constructor, Creator, Input, Modifiable, Output};
+use bitcoin::{Script};
+use psbt_v2::v2::{Input};
 use silentpayments::utils::NUMS_H;
 
 use crate::Error;
@@ -43,4 +42,12 @@ pub(crate) fn is_input_eligible(input: &Input) -> Result<bool, Error> {
 
     // All other types are ineligible (multisig, etc.)
     Ok(false)
+}
+
+pub fn to_rust_dleq(p: psbt_v2::v2::dleq::DleqProof) -> rust_dleq::DleqProof {
+    rust_dleq::DleqProof(p.0)
+}
+
+pub fn to_psbt_dleq(p: rust_dleq::DleqProof) -> psbt_v2::v2::dleq::DleqProof {
+    psbt_v2::v2::dleq::DleqProof(p.0)
 }

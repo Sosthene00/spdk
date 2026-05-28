@@ -9,13 +9,13 @@
 
 use std::collections::HashMap;
 
+use crate::core::utils::to_rust_dleq;
 use crate::core::{utils::is_input_eligible, Error, Psbt, Result};
-use crate::crypto::dleq_verify_proof;
-use crate::roles::Bip375OutputConstructorExt;
 use bitcoin::consensus::serialize;
 use bitcoin::key::TweakedPublicKey;
 use bitcoin::{CompressedPublicKey, OutPoint};
 use bitcoin::{ScriptBuf, XOnlyPublicKey};
+use rust_dleq::verify_dleq_proof;
 use secp256k1::{Parity, PublicKey, Secp256k1, SecretKey};
 use silentpayments::sending::{generate_recipient_pubkeys, GeneratePubkeysInput};
 use silentpayments::utils::common::{
@@ -42,17 +42,22 @@ pub trait SignerPsbtExt {
 
 impl SignerPsbtExt for Psbt {
     fn aggregate_ecdh_shares(&mut self, secp: &Secp256k1<secp256k1::All>) -> Result<()> {
-        let scan_keys = self
-            .outputs
-            .iter()
-            .filter_map(|o| {
-                if let Some((scan_key, _)) = o.get_sp_info() {
-                    Some(scan_key)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut scan_keys = Vec::new();
+        for (i, output) in self.outputs.iter().enumerate() {
+            let Some(sp_info) = output.sp_v0_info.as_ref() else {
+                continue;
+            };
+            let sp_info_bytes = sp_info.as_slice();
+            if sp_info_bytes.len() != 66 {
+                return Err(Error::InvalidFieldData(format!(
+                    "Output {} has invalid SP info length: {}",
+                    i,
+                    sp_info_bytes.len()
+                )));
+            }
+            let scan_key = PublicKey::from_slice(&sp_info_bytes[..33])?;
+            scan_keys.push(scan_key);
+        }
 
         let mut global_ecdh_shares: HashMap<PublicKey, Vec<PublicKey>> =
             scan_keys.iter().map(|key| (*key, Vec::new())).collect();
@@ -119,7 +124,7 @@ impl SignerPsbtExt for Psbt {
 
                 // Check the proof is valid
                 let is_valid =
-                    dleq_verify_proof(secp, &input_pubkey, key, &share.0, proof, None)
+                    verify_dleq_proof(secp, &input_pubkey, key, &share.0, &to_rust_dleq(*proof), None)
                         .map_err(|e| Error::Other(format!("DLEQ verification failed: {}", e)))?;
                 if !is_valid {
                     return Err(Error::Other(format!(
@@ -172,8 +177,19 @@ impl SignerPsbtExt for Psbt {
         // We must add all the outpoints and use the sum to tweak each ecdh share
         let mut generate_recipients_inputs: HashMap<PublicKey, GeneratePubkeysInput> =
             HashMap::new();
-        for sp_output in self.outputs.iter().filter(|o| o.sp_v0_info.is_some()) {
-            let (scan_key, spend_key) = sp_output.get_sp_info().unwrap();
+        for output in self.outputs.iter() {
+            let Some(sp_info) = output.sp_v0_info.as_ref() else {
+                continue;
+            };
+            let sp_info_bytes = sp_info.as_slice();
+            if sp_info_bytes.len() != 66 {
+                return Err(Error::InvalidFieldData(format!(
+                    "Output has invalid SP info length: {}",
+                    sp_info_bytes.len()
+                )));
+            }
+            let scan_key = PublicKey::from_slice(&sp_info_bytes[..33])?;
+            let spend_key = PublicKey::from_slice(&sp_info_bytes[33..])?;
             if let Some(input) = generate_recipients_inputs.get_mut(&scan_key) {
                 input.spend_keys.push(spend_key);
             } else {

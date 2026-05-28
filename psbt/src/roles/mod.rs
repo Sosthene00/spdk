@@ -17,14 +17,12 @@
 //!   - Would handle union of ECDH shares, DLEQ proofs, and signatures
 //!   - Conflict detection for same-field different-value scenarios
 
-pub mod constructor;
 pub mod extractor;
 pub mod input_witness_finalizer;
 pub mod signer;
 pub mod updater;
 // pub mod validation;
 
-pub use constructor::*;
 pub use extractor::*;
 pub use input_witness_finalizer::*;
 pub use signer::*;

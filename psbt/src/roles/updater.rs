@@ -4,7 +4,6 @@ use bitcoin::{
 };
 use psbt_v2::v2::Input;
 use secp256k1::PublicKey;
-use silentpayments::utils::common::{InputHashApplied, SharedSecret};
 
 pub trait Bip375UpdaterExt {
     fn get_sp_spend_bip32_derivation(&self) -> Option<(PublicKey, Fingerprint, DerivationPath)>;
@@ -79,11 +78,3 @@ impl Bip375UpdaterExt for Input {
         previous_tweak
     }
 }
-
-// pub trait EcdhShareUpdaterExt {
-//     fn compute_ecdh_share(
-//         &self,
-//         scan_key: &PublicKey,
-//         spend_key: &PublicKey,
-//     ) -> Result<PublicKey>;
-// }

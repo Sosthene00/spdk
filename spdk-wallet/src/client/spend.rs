@@ -15,7 +15,6 @@ use bitcoin::{
 };
 use psbt::Psbt;
 use psbt::core::{Input, Output};
-use psbt::roles::Bip375OutputConstructorExt;
 use psbt_v2::v2::{Constructor, Creator, Modifiable};
 use silentpayments::utils::sending::TypedSecretKey;
 use silentpayments::{Network as SpNetwork, utils::common::InputHashApplied};
@@ -178,10 +177,10 @@ impl SpClient {
                     // We add the sp address to the output
                     let mut psbt = constructor.psbt()?;
                     let output = psbt.outputs.last_mut().expect("we just added it");
-                    output.set_sp_info(sp_address);
+                    output.sp_v0_info.as_mut().map(|info| info.copy_from_slice(&sp_address.to_byte_array()[1..]));
                     // If output is our change address we also set that
                     if change_address == *sp_address {
-                        output.set_sp_label(0);
+                        output.sp_v0_label = Some(0);
                     }
                     // We convert the psbt back to a constructor
                     constructor = Constructor::<Modifiable>::new(psbt)?;
@@ -296,7 +295,7 @@ impl SpClient {
                 // We add the sp address to the output
                 let mut psbt = constructor.psbt()?;
                 let output = psbt.outputs.last_mut().expect("we just added it");
-                output.set_sp_info(&sp_address);
+                output.sp_v0_info.as_mut().map(|info| info.copy_from_slice(&sp_address.to_byte_array()[1..]));
                 // We convert the psbt back to a constructor
                 constructor = Constructor::<Modifiable>::new(psbt)?;
             }
