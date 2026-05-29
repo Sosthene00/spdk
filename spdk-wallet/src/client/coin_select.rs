@@ -8,6 +8,70 @@ pub struct InputSelection {
     pub fee: Amount,
 }
 
+pub fn select_all_utxos_for_fee_rate(
+    available_utxos: Vec<(OutPoint, TxOut)>,
+    tx_outs: Vec<TxOut>,
+    fee_rate: FeeRate,
+) -> Result<InputSelection> {
+    // as a silent payment wallet, we only spend taproot outputs
+    let candidates: Vec<Candidate> = available_utxos
+        .iter()
+        .map(|(_, o)| {
+            if o.script_pubkey.is_p2tr() {
+                Candidate::new_tr_keyspend(o.value.to_sat())
+            } else {
+                unimplemented!()
+            }
+        })
+        .collect();
+
+    let mut coin_selector = CoinSelector::new(&candidates);
+
+    let mut n_outputs = 0;
+    let mut output_weight = 0;
+    for tx_out in tx_outs {
+        n_outputs += 1;
+        output_weight += tx_out.weight().to_wu();
+    }
+
+    let drain_output = DrainWeights {
+            output_weight,
+            spend_weight: 0,
+            n_outputs,
+        };
+
+    let change_policy =
+        ChangePolicy::min_value(drain_output, 0);
+
+    let target = Target {
+        fee: TargetFee::from_feerate(fee_rate),
+        outputs: TargetOutputs {
+            value_sum: 0,
+            weight_sum: 0,
+            n_outputs: 0
+        }
+    };
+
+    coin_selector.select_all();
+
+    let change = coin_selector.drain(target, change_policy);
+
+    if change.is_none() {
+        return Err(anyhow::Error::msg("No funds available"));
+    }
+
+    let fee_value = coin_selector.fee(target.outputs.value_sum, change.value);
+    if fee_value < 0 {
+        return Err(anyhow::Error::msg("Not enough funds available")); // Maybe if we have very little funds and environment is high fees?
+    }
+
+    Ok(InputSelection {
+        selected_utxos: coin_selector.selected_indices().iter().map(|i| available_utxos[*i].0).collect(),
+        change: Amount::from_sat(change.value),
+        fee: Amount::from_sat(fee_value as u64),
+    })
+}
+
 pub fn pick_utxos_for_fee_rate(
     available_utxos: Vec<(OutPoint, TxOut)>,
     tx_outs: Vec<TxOut>,
