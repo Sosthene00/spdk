@@ -1,7 +1,12 @@
 use anyhow::Result;
+use bdk_coin_select::metrics::{Changeless, LowestFee};
 use bdk_coin_select::{Candidate, ChangePolicy, CoinSelector, DrainWeights, FeeRate, TR_DUST_RELAY_MIN_VALUE, Target, TargetFee, TargetOutputs};
 use bitcoin::{Amount, OutPoint, TxOut};
 
+/// Upper bound on branch-and-bound iterations (see `bdk_coin_select` README).
+const BNB_MAX_ROUNDS: usize = 10_000;
+
+#[derive(Debug)]
 pub struct InputSelection {
     pub selected_utxos: Vec<OutPoint>,
     pub change: Amount,
@@ -104,7 +109,22 @@ pub fn pick_utxos_for_fee_rate(
         ),
     };
 
-    coin_selector.select_until_target_met(target)?;
+    let changeless = Changeless {
+        target,
+        change_policy,
+    };
+    if coin_selector.run_bnb(changeless, BNB_MAX_ROUNDS).is_err() {
+        let lowest_fee = LowestFee {
+            target,
+            long_term_feerate: fee_rate,
+            change_policy,
+        };
+        if coin_selector.run_bnb(lowest_fee, BNB_MAX_ROUNDS).is_err() {
+            coin_selector
+                .select_until_target_met(target)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+        }
+    }
 
     // get the utxos that have been chosen by the coin selector
     let selected_indices = coin_selector.selected_indices();
@@ -127,4 +147,325 @@ pub fn pick_utxos_for_fee_rate(
         change: Amount::from_sat(change_value),
         fee: Amount::from_sat(fee_value as u64),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bdk_coin_select::TR_DUST_RELAY_MIN_VALUE;
+    use bitcoin::key::{Keypair, TapTweak};
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bitcoin::hashes::Hash;
+    use bitcoin::{ScriptBuf, Txid};
+
+    fn test_fee_rate() -> FeeRate {
+        fee_rate_sat_per_vb(1.0)
+    }
+
+    fn fee_rate_sat_per_vb(sat_per_vb: f32) -> FeeRate {
+        FeeRate::from_sat_per_vb(sat_per_vb)
+    }
+
+    fn p2tr_txout(value_sat: u64) -> TxOut {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[0x42; 32]).expect("valid test key");
+        let keypair = Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = keypair.x_only_public_key();
+        let tweaked = xonly.tap_tweak(&secp, None).0;
+        TxOut {
+            value: Amount::from_sat(value_sat),
+            script_pubkey: ScriptBuf::new_p2tr_tweaked(tweaked),
+        }
+    }
+
+    fn utxo(value_sat: u64, vout: u32) -> (OutPoint, TxOut) {
+        (
+            OutPoint::new(Txid::all_zeros(), vout),
+            p2tr_txout(value_sat),
+        )
+    }
+
+    fn payment_output(value_sat: u64) -> TxOut {
+        p2tr_txout(value_sat)
+    }
+
+    fn many_utxos(count: usize, value_sat: u64) -> Vec<(OutPoint, TxOut)> {
+        (0..count as u32).map(|vout| utxo(value_sat, vout)).collect()
+    }
+
+    fn selected_input_sum(
+        utxos: &[(OutPoint, TxOut)],
+        selection: &InputSelection,
+    ) -> u64 {
+        selection
+            .selected_utxos
+            .iter()
+            .map(|op| {
+                utxos
+                    .iter()
+                    .find(|(o, _)| o == op)
+                    .map(|(_, txo)| txo.value.to_sat())
+                    .expect("selected outpoint must exist in pool")
+            })
+            .sum()
+    }
+
+    fn assert_selection_balances(
+        utxos: &[(OutPoint, TxOut)],
+        selection: &InputSelection,
+        payment_sat: u64,
+    ) {
+        let input_sum = selected_input_sum(utxos, selection);
+        assert_eq!(
+            selection.change.to_sat() + selection.fee.to_sat() + payment_sat,
+            input_sum,
+        );
+    }
+
+    #[test]
+    fn select_all_utxos_uses_every_input() {
+        let utxos = vec![utxo(100_000, 0), utxo(200_000, 1)];
+        let outpoints: Vec<_> = utxos.iter().map(|(op, _)| *op).collect();
+
+        let selection =
+            select_all_utxos_for_fee_rate(utxos, vec![], test_fee_rate()).expect("selection");
+
+        assert_eq!(selection.selected_utxos.len(), 2);
+        for op in outpoints {
+            assert!(selection.selected_utxos.contains(&op));
+        }
+        assert!(selection.fee > Amount::ZERO);
+        assert!(selection.change > Amount::ZERO);
+        assert_eq!(selection.change + selection.fee, Amount::from_sat(300_000));
+    }
+
+    #[test]
+    fn select_all_utxos_accounts_for_output_weight() {
+        let utxos = vec![utxo(500_000, 0)];
+        let outputs = vec![payment_output(0)];
+
+        let without_outputs =
+            select_all_utxos_for_fee_rate(utxos.clone(), vec![], test_fee_rate()).expect("selection");
+        let with_outputs =
+            select_all_utxos_for_fee_rate(utxos, outputs, test_fee_rate()).expect("selection");
+
+        assert!(with_outputs.fee >= without_outputs.fee);
+        assert!(with_outputs.change <= without_outputs.change);
+        assert_eq!(
+            with_outputs.change + with_outputs.fee,
+            without_outputs.change + without_outputs.fee,
+        );
+    }
+
+    #[test]
+    fn select_all_utxos_empty_inputs_fails() {
+        let err = select_all_utxos_for_fee_rate(vec![], vec![], test_fee_rate())
+            .expect_err("expected error");
+        assert_eq!(err.to_string(), "No funds available");
+    }
+
+    #[test]
+    fn pick_utxos_prefers_single_input_when_sufficient() {
+        let large = utxo(500_000, 0);
+        let small = utxo(100_000, 1);
+        let payment = payment_output(50_000);
+
+        let selection = pick_utxos_for_fee_rate(
+            vec![large.clone(), small],
+            vec![payment],
+            test_fee_rate(),
+        )
+        .expect("selection");
+
+        assert_eq!(selection.selected_utxos, vec![large.0]);
+        assert!(selection.fee > Amount::ZERO);
+    }
+
+    #[test]
+    fn pick_utxos_combines_inputs_when_one_is_not_enough() {
+        let a = utxo(30_000, 0);
+        let b = utxo(30_000, 1);
+        let payment = payment_output(50_000);
+
+        let selection = pick_utxos_for_fee_rate(
+            vec![a.clone(), b.clone()],
+            vec![payment],
+            test_fee_rate(),
+        )
+        .expect("selection");
+
+        assert_eq!(selection.selected_utxos.len(), 2);
+        assert!(selection.selected_utxos.contains(&a.0));
+        assert!(selection.selected_utxos.contains(&b.0));
+        assert_eq!(
+            selection.change + selection.fee + Amount::from_sat(50_000),
+            Amount::from_sat(60_000),
+        );
+    }
+
+    #[test]
+    fn pick_utxos_emits_change_above_dust_threshold() {
+        let utxos = vec![utxo(500_000, 0)];
+        let payment = payment_output(50_000);
+
+        let selection =
+            pick_utxos_for_fee_rate(utxos, vec![payment], test_fee_rate()).expect("selection");
+
+        let min_change = TR_DUST_RELAY_MIN_VALUE * 2;
+        assert!(
+            selection.change == Amount::ZERO || selection.change >= Amount::from_sat(min_change),
+            "change {} below dust policy minimum {}",
+            selection.change,
+            min_change,
+        );
+        assert_eq!(
+            selection.change + selection.fee + Amount::from_sat(50_000),
+            Amount::from_sat(500_000),
+        );
+    }
+
+    /// At 1 sat/vB a single input can fund the payment with no change; at 5 sat/vB the same
+    /// input is insufficient, a second input is required, and the excess must become change.
+    #[test]
+    fn pick_utxos_fee_rate_affects_changeless_vs_change() {
+        let low = fee_rate_sat_per_vb(1.0);
+        let high = fee_rate_sat_per_vb(5.0);
+        let min_change = TR_DUST_RELAY_MIN_VALUE * 2;
+        // Sized so 25_250 sats covers payment + fee at 1 sat/vB with no change; at 5 sat/vB
+        // that input alone is insufficient and the 2_500 sat top-up is required, which leaves
+        // excess above the dust policy (unavoidable change).
+        let payment_sat = 25_000;
+        let primary_sat = 25_250;
+        let second_sat = 2_500;
+
+        let payment = payment_output(payment_sat);
+        let pool = vec![utxo(primary_sat, 0), utxo(second_sat, 1)];
+
+        let low_sel =
+            pick_utxos_for_fee_rate(pool.clone(), vec![payment.clone()], low).expect("low fee");
+        assert_eq!(low_sel.change, Amount::ZERO);
+        assert_eq!(low_sel.selected_utxos, vec![utxo(primary_sat, 0).0]);
+        assert_selection_balances(&pool, &low_sel, payment_sat);
+
+        assert!(
+            pick_utxos_for_fee_rate(vec![utxo(primary_sat, 0)], vec![payment.clone()], high)
+                .is_err(),
+            "primary input alone must not fund the payment at 5 sat/vB",
+        );
+
+        let high_sel = pick_utxos_for_fee_rate(pool.clone(), vec![payment], high).expect("high fee");
+        assert_eq!(high_sel.selected_utxos.len(), 2);
+        assert!(high_sel.selected_utxos.contains(&utxo(primary_sat, 0).0));
+        assert!(high_sel.selected_utxos.contains(&utxo(second_sat, 1).0));
+        assert!(high_sel.change >= Amount::from_sat(min_change));
+        assert_selection_balances(&pool, &high_sel, payment_sat);
+    }
+
+    #[test]
+    fn pick_utxos_uses_changeless_when_exact_input_exists() {
+        let payment_sat = 50_000;
+        let fee_rate = test_fee_rate();
+        let exact_sat = (payment_sat..payment_sat + 5_000)
+            .find(|&value_sat| {
+                pick_utxos_for_fee_rate(
+                    vec![utxo(value_sat, 0), utxo(1_000_000, 1)],
+                    vec![payment_output(payment_sat)],
+                    fee_rate,
+                )
+                .ok()
+                .is_some_and(|selection| {
+                    selection.change == Amount::ZERO
+                        && selection.selected_utxos == vec![utxo(value_sat, 0).0]
+                })
+            })
+            .expect("a changeless single-input fixture must exist");
+
+        let selection = pick_utxos_for_fee_rate(
+            vec![utxo(exact_sat, 0), utxo(1_000_000, 1)],
+            vec![payment_output(payment_sat)],
+            fee_rate,
+        )
+        .expect("selection");
+
+        assert_eq!(selection.change, Amount::ZERO);
+        assert_eq!(selection.selected_utxos, vec![utxo(exact_sat, 0).0]);
+    }
+
+    #[test]
+    fn pick_utxos_insufficient_funds() {
+        let utxos = vec![utxo(1_000, 0)];
+        let payment = payment_output(1_000_000);
+
+        assert!(pick_utxos_for_fee_rate(utxos, vec![payment], test_fee_rate()).is_err());
+    }
+
+    #[test]
+    fn pick_utxos_many_utxos_one_large_covers_payment() {
+        let mut utxos = many_utxos(250, 10_000);
+        let whale = utxo(10_000_000, 250);
+        utxos.push(whale.clone());
+        let payment = payment_output(100_000);
+
+        let selection = pick_utxos_for_fee_rate(utxos.clone(), vec![payment], test_fee_rate())
+            .expect("selection");
+
+        assert_eq!(selection.selected_utxos, vec![whale.0]);
+        assert!(selection.selected_utxos.len() < utxos.len());
+        assert_selection_balances(&utxos, &selection, 100_000);
+    }
+
+    #[test]
+    fn pick_utxos_many_utxos_combines_small_inputs() {
+        let utxos = many_utxos(200, 10_000);
+        let payment = payment_output(150_000);
+
+        let selection = pick_utxos_for_fee_rate(utxos.clone(), vec![payment], test_fee_rate())
+            .expect("selection");
+
+        assert!(!selection.selected_utxos.is_empty());
+        assert!(selection.selected_utxos.len() <= utxos.len());
+        assert_selection_balances(&utxos, &selection, 150_000);
+        let min_change = TR_DUST_RELAY_MIN_VALUE * 2;
+        assert!(
+            selection.change == Amount::ZERO || selection.change >= Amount::from_sat(min_change),
+        );
+    }
+
+    #[test]
+    fn pick_utxos_many_utxos_does_not_use_entire_pool() {
+        let utxos = many_utxos(300, 50_000);
+        let payment = payment_output(25_000);
+
+        let selection = pick_utxos_for_fee_rate(utxos.clone(), vec![payment], test_fee_rate())
+            .expect("selection");
+
+        assert!(selection.selected_utxos.len() < utxos.len());
+        assert_selection_balances(&utxos, &selection, 25_000);
+    }
+
+    #[test]
+    fn pick_utxos_many_utxos_insufficient_funds() {
+        let utxos = many_utxos(200, 1_000);
+        let payment = payment_output(500_000);
+
+        assert!(pick_utxos_for_fee_rate(utxos, vec![payment], test_fee_rate()).is_err());
+    }
+
+    #[test]
+    fn select_all_utxos_many_inputs() {
+        let utxos = many_utxos(400, 25_000);
+        let outpoints: Vec<_> = utxos.iter().map(|(op, _)| *op).collect();
+
+        let selection =
+            select_all_utxos_for_fee_rate(utxos, vec![], test_fee_rate()).expect("selection");
+
+        assert_eq!(selection.selected_utxos.len(), 400);
+        for op in outpoints {
+            assert!(selection.selected_utxos.contains(&op));
+        }
+        assert_eq!(
+            selection.change + selection.fee,
+            Amount::from_sat(400 * 25_000),
+        );
+    }
 }
