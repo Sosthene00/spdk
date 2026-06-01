@@ -7,10 +7,20 @@ use bitcoin::{Amount, OutPoint, TxOut};
 const BNB_MAX_ROUNDS: usize = 10_000;
 
 #[derive(Debug)]
+pub enum Strategy {
+    Changeless,
+    LowestFee,
+    Greedy, // Fallback
+    Drain, // for the drain transaction case
+}
+
+#[derive(Debug)]
 pub struct InputSelection {
     pub selected_utxos: Vec<OutPoint>,
     pub change: Amount,
     pub fee: Amount,
+    pub actual_fee_rate: FeeRate,
+    pub strategy: Strategy,
 }
 
 pub fn select_all_utxos_for_fee_rate(
@@ -70,10 +80,16 @@ pub fn select_all_utxos_for_fee_rate(
         return Err(anyhow::Error::msg("Not enough funds available")); // Maybe if we have very little funds and environment is high fees?
     }
 
+    let actual_fee_rate = coin_selector
+        .implied_feerate(target.outputs, change)
+        .ok_or_else(|| anyhow::Error::msg("cannot compute effective feerate for selection"))?;
+
     Ok(InputSelection {
         selected_utxos: coin_selector.selected_indices().iter().map(|i| available_utxos[*i].0).collect(),
         change: Amount::from_sat(change.value),
         fee: Amount::from_sat(fee_value as u64),
+        actual_fee_rate,
+        strategy: Strategy::Drain,
     })
 }
 
@@ -96,7 +112,6 @@ pub fn pick_utxos_for_fee_rate(
 
     let mut coin_selector = CoinSelector::new(&candidates);
 
-    // The min may need to be adjusted, 2 or 3x that would be sensible
     let change_policy =
         ChangePolicy::min_value(DrainWeights::TR_KEYSPEND, TR_DUST_RELAY_MIN_VALUE * 2);
 
@@ -109,11 +124,15 @@ pub fn pick_utxos_for_fee_rate(
         ),
     };
 
+    let strategy: Strategy;
+
     let changeless = Changeless {
         target,
         change_policy,
     };
-    if coin_selector.run_bnb(changeless, BNB_MAX_ROUNDS).is_err() {
+    if let Ok(_score) = coin_selector.run_bnb(changeless, BNB_MAX_ROUNDS) {
+        strategy = Strategy::Changeless;
+    } else {
         let lowest_fee = LowestFee {
             target,
             long_term_feerate: fee_rate,
@@ -123,6 +142,9 @@ pub fn pick_utxos_for_fee_rate(
             coin_selector
                 .select_until_target_met(target)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            strategy = Strategy::Greedy;
+        } else {
+            strategy = Strategy::LowestFee;
         }
     }
 
@@ -142,10 +164,16 @@ pub fn pick_utxos_for_fee_rate(
         return Err(anyhow::Error::msg("Not enough funds available"));
     }
 
+    let actual_fee_rate = coin_selector
+        .implied_feerate(target.outputs, change)
+        .ok_or_else(|| anyhow::Error::msg("cannot compute effective feerate for selection"))?;
+
     Ok(InputSelection {
         selected_utxos,
         change: Amount::from_sat(change_value),
         fee: Amount::from_sat(fee_value as u64),
+        actual_fee_rate,
+        strategy,
     })
 }
 
