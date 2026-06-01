@@ -6,7 +6,7 @@ use bitcoin::{Amount, OutPoint, TxOut};
 /// Upper bound on branch-and-bound iterations (see `bdk_coin_select` README).
 const BNB_MAX_ROUNDS: usize = 10_000;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Strategy {
     Changeless,
     LowestFee,
