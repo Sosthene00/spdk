@@ -1,5 +1,5 @@
 use bitcoin::OutPoint;
-use psbt_v2::v2::{Constructor, Creator, Input, InputsOnlyModifiable, Output};
+use psbt_v2::v2::{Constructor, Creator, Input, InputsOnlyModifiable, Output, OutputsOnlyModifiable};
 use rand::seq::SliceRandom;
 
 use crate::core::{Error, Psbt, Result};
@@ -12,6 +12,11 @@ pub trait ConstructorPsbtExt {
     fn add_inputs(
         self,
         selected_outpoints: Vec<OutPoint>,
+    ) -> Result<Self> where Self: Sized;
+
+    fn add_outputs(
+        self,
+        outputs: Vec<Output>,
     ) -> Result<Self> where Self: Sized;
 }
 
@@ -42,6 +47,22 @@ impl ConstructorPsbtExt for Psbt {
         // add inputs
         for outpoint in selected_outpoints {
             constructor = constructor.input(Input::new(&outpoint));
+        }
+
+        Ok(constructor.psbt()?)
+    }
+
+    fn add_outputs(
+        self,
+        outputs: Vec<Output>,
+    ) -> Result<Self> where Self: Sized
+    {
+        let mut constructor = Constructor::<OutputsOnlyModifiable>::new(self)
+            .map_err(|e| Error::Other(e.to_string()))?;
+
+        // add outputs
+        for output in outputs {
+            constructor = constructor.output(output);
         }
 
         Ok(constructor.psbt()?)
