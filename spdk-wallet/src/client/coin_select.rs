@@ -18,6 +18,7 @@ pub enum Strategy {
 pub struct InputSelection {
     pub selected_utxos: Vec<OutPoint>,
     pub change: Amount,
+    pub n_change_outputs: usize,
     pub fee: Amount,
     pub actual_fee_rate: FeeRate,
     pub strategy: Strategy,
@@ -92,6 +93,7 @@ pub fn select_all_utxos_for_fee_rate(
     Ok(InputSelection {
         selected_utxos: coin_selector.selected_indices().iter().map(|i| available_utxos[*i].0).collect(),
         change: Amount::from_sat(change.value),
+        n_change_outputs: n_outputs,
         fee: Amount::from_sat(fee_value as u64),
         actual_fee_rate,
         strategy: Strategy::Drain,
@@ -181,6 +183,7 @@ pub fn pick_utxos_for_fee_rate(
     Ok(InputSelection {
         selected_utxos,
         change: Amount::from_sat(change_value),
+        n_change_outputs,
         fee: Amount::from_sat(fee_value as u64),
         actual_fee_rate,
         strategy,
