@@ -103,7 +103,7 @@ pub fn select_all_utxos_for_fee_rate(
 pub fn pick_utxos_for_fee_rate(
     available_utxos: Vec<(OutPoint, TxOut)>,
     tx_outs: Vec<TxOut>,
-    n_change_outputs: usize,
+    mut n_change_outputs: usize,
     fee_rate: FeeRate,
 ) -> Result<InputSelection> {
     // as a silent payment wallet, we only spend taproot outputs
@@ -171,6 +171,7 @@ pub fn pick_utxos_for_fee_rate(
     // if there is change, add a return address to the list of recipients
     let change = coin_selector.drain(target, change_policy);
     let change_value = if change.is_some() { change.value } else { 0 };
+    if change_value == 0 { n_change_outputs = 0 };
     let fee_value = coin_selector.fee(target.outputs.value_sum, change_value);
     if fee_value < 0 {
         return Err(anyhow::Error::msg("Not enough funds available"));
