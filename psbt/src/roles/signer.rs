@@ -378,16 +378,22 @@ fn collect_sp_v0_keys(psbt: &Psbt) -> Result<Vec<Option<SilentPaymentKeyMaterial
 /// Extract the BIP-352 input public key from PSBT fields populated by the Updater.
 ///
 /// Returns `Some(pubkey)` for each eligible script type:
-/// - **P2TR with `sp_tweak`**: reads the tweaked spend key from `sp_spend_bip32_derivations`.
-/// - **P2TR without `sp_tweak`**: reads `tap_internal_key`, promoted to even parity (BIP-352 §3).
+/// - **P2TR**: reads the output key from the funding scriptPubKey, promoted to even parity
+///   (BIP-352 §3). This also covers SP inputs (`sp_tweak` set): per BIP-376 the
+///   `sp_spend_bip32_derivations` map key is the *untweaked* spend key `B_spend`, used only
+///   for signer key lookup — the key used for ECDH is the output key itself, which is
+///   `B_spend + tweak·G` by construction. Reading it from the prevout instead of an
+///   updater-declared field is what makes a wrong or malicious `sp_tweak` fail closed at
+///   key-resolution time.
+/// - **P2TR without `sp_tweak`**: a NUMS_H `tap_internal_key` means no key path, so the
+///   input is skipped (BIP-352 §3). SP outputs always have a key path, so the exception
+///   does not apply to them.
 /// - **P2WPKH / P2PKH**: reads from `bip32_derivations`.
 /// - **P2SH-P2WPKH**: checks that `redeem_script` is P2WPKH, then reads from `bip32_derivations`.
 ///
 /// Returns `Ok(None)` when the input is not eligible or when the required PSBT fields have not
 /// been populated by the Updater yet.
-pub fn extract_eligible_input_pubkey(
-    input: &Input,
-) -> Result<Option<PublicKey>> {
+pub fn extract_eligible_input_pubkey(input: &Input) -> Result<Option<PublicKey>> {
     let funding_utxo = input
         .funding_utxo()
         .map_err(|_| Error::Other("Input missing funding utxo".to_string()))?;
@@ -398,27 +404,21 @@ pub fn extract_eligible_input_pubkey(
     }
 
     if spk.is_p2tr() {
-        if input.sp_tweak.is_some() {
-            // SP tweaked output: the tweaked spend key is what BIP-352 uses for ECDH.
-            let (pubkey, _, _) = input.get_sp_spend_bip32_derivation().ok_or_else(|| {
-                Error::Other("P2TR SP input missing sp_spend_bip32_derivation".to_string())
-            })?;
-            Ok(Some(pubkey))
-        } else {
-            // BIP-352 §3: use the taproot **output key** (from the scriptPubKey), not the
-            // internal key. The sender signs with the tweaked private key and the receiver
-            // reads the same key from the scriptPubKey.
-            //
-            // Exception (BIP-352 §3): if the internal key is NUMS_H the output has no
-            // key path, so there is no private key to contribute — skip this input.
+        if input.sp_tweak.is_none() {
+            // Plain taproot input. Exception (BIP-352 §3): if the internal key is
+            // NUMS_H the output has no key path, so there is no private key to
+            // contribute — skip this input.
             if let Some(internal_key) = input.tap_internal_key {
                 if internal_key.serialize() == NUMS_H {
                     return Ok(None);
                 }
             }
-            let output_xonly = XOnlyPublicKey::from_slice(&spk.as_bytes()[2..])?;
-            Ok(Some(output_xonly.public_key(Parity::Even)))
         }
+        // BIP-352 §3: use the taproot **output key** (from the scriptPubKey), not the
+        // internal key. The sender signs with the tweaked private key and the receiver
+        // reads the same key from the scriptPubKey.
+        let output_xonly = XOnlyPublicKey::from_slice(&spk.as_bytes()[2..])?;
+        Ok(Some(output_xonly.public_key(Parity::Even)))
     } else if spk.is_p2wpkh() || spk.is_p2pkh() {
         let (pubkey, _, _) = input
             .get_bip32_derivation()
@@ -442,8 +442,10 @@ pub fn extract_eligible_input_pubkey(
 
 /// Resolve the private key for an eligible input owned by `spend_key`.
 ///
-/// Calls [`extract_eligible_input_pubkey`] to read the public key declared by the Updater, then
-/// checks whether `spend_key` (with `sp_tweak` applied for SP P2TR inputs) produces that key.
+/// Calls [`extract_eligible_input_pubkey`] to read the input's public key (from the funding
+/// output for P2TR), then checks whether `spend_key` (with `sp_tweak` applied for SP P2TR
+/// inputs) produces that key. For SP inputs this doubles as the BIP-376 tweak verification:
+/// a wrong `sp_tweak` makes the tweaked candidate mismatch the prevout's output key.
 ///
 /// For P2TR the comparison is x-only (parity-agnostic); for ECDSA types the full compressed
 /// public key must match.

@@ -11,13 +11,14 @@
 
 use bitcoin::bip32::{DerivationPath, Fingerprint};
 use bitcoin::hashes::Hash;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxOut, Txid, XOnlyPublicKey};
+use bitcoin::key::TapTweak;
+use bitcoin::{Amount, CompressedPublicKey, OutPoint, ScriptBuf, Sequence, TxOut, Txid, XOnlyPublicKey};
 use psbt::roles::signer::extract_eligible_input_pubkey;
 use psbt::roles::updater::Bip375UpdaterExt;
 use psbt::roles::{ConstructorPsbtExt, SignerPsbtExt};
 use psbt::Psbt;
 use psbt_v2::v2::{Input, Output};
-use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use secp256k1::{Parity, PublicKey, Scalar, Secp256k1, SecretKey};
 use silentpayments::utils::NUMS_H;
 
 // ── test helpers ──────────────────────────────────────────────────────────────
@@ -410,4 +411,57 @@ fn test_multi_signer_compute_sp_outputs_with_non_eligible_input() {
 
     // This call currently fails: "No shares found".
     psbt.compute_sp_outputs(&secp).unwrap();
+}
+
+/// P2TR input with `sp_tweak` set (SP spend): the BIP-352 input pubkey is the
+/// even-lifted output key from the funding scriptPubKey — for an SP output that
+/// is `B_spend + tweak·G` by construction. Per BIP-376 the
+/// `sp_spend_bip32_derivations` map key is the *untweaked* spend key and is only
+/// used for signer key lookup; it must not be read here.
+#[test]
+fn test_extract_p2tr_sp_tweak_reads_output_key_from_prevout() {
+    let secp = secp();
+    let spend = sk(1);
+    let tweak = Scalar::from_be_bytes(sk(2).secret_bytes()).unwrap();
+    let tweaked = spend.add_tweak(&tweak).unwrap();
+    let (xonly, _) = tweaked.x_only_public_key(&secp);
+
+    let mut input = Input::new(&outpoint(0));
+    input.witness_utxo = Some(TxOut {
+        value: Amount::from_sat(1_000),
+        // SP outputs place the derived key directly, without a BIP-341 tweak.
+        script_pubkey: ScriptBuf::new_p2tr_tweaked(xonly.dangerous_assume_tweaked()),
+    });
+    input.set_sp_tweak(sk(2).secret_bytes());
+    // BIP-376: the map key is the untweaked spend key B_spend.
+    input.set_sp_spend_bip32_derivation(
+        CompressedPublicKey(spend.public_key(&secp)),
+        Fingerprint::default(),
+        DerivationPath::default(),
+    );
+
+    let result = extract_eligible_input_pubkey(&input).unwrap();
+    assert_eq!(result, Some(xonly.public_key(Parity::Even)));
+}
+
+/// An SP input without `sp_spend_bip32_derivations` still yields its output key:
+/// the field is a key-lookup aid (BIP-376 SHOULD), not an input to the ECDH
+/// extraction. Its presence is enforced by validation, not by this function.
+#[test]
+fn test_extract_p2tr_sp_tweak_without_derivation_map() {
+    let secp = secp();
+    let tweaked = sk(1)
+        .add_tweak(&Scalar::from_be_bytes(sk(2).secret_bytes()).unwrap())
+        .unwrap();
+    let (xonly, _) = tweaked.x_only_public_key(&secp);
+
+    let mut input = Input::new(&outpoint(0));
+    input.witness_utxo = Some(TxOut {
+        value: Amount::from_sat(1_000),
+        script_pubkey: ScriptBuf::new_p2tr_tweaked(xonly.dangerous_assume_tweaked()),
+    });
+    input.set_sp_tweak(sk(2).secret_bytes());
+
+    let result = extract_eligible_input_pubkey(&input).unwrap();
+    assert_eq!(result, Some(xonly.public_key(Parity::Even)));
 }
