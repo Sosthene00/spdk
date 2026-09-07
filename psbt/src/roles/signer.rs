@@ -77,7 +77,7 @@ impl SignerPsbtExt for Psbt {
         }
 
         // A single signer owns every eligible input, so resolving any one of them is mandatory.
-        let mut summed_keys: Vec<NormalizedSecretKey> = Vec::new();
+        let mut summed_keys: Vec<NormalizedSecretKey> = Vec::with_capacity(self.inputs.len());
         for (vin, input) in self.inputs.iter().enumerate() {
             let funding_utxo = input
                 .funding_utxo()
@@ -137,14 +137,9 @@ impl SignerPsbtExt for Psbt {
 
             for scan_key in &scan_keys {
                 let aux_rand: [u8; 32] = rand::random();
-                let partial = PartialSenderEcdhShare::new(
-                    secp,
-                    scan_key.0,
-                    vin,
-                    &normalized,
-                    &aux_rand,
-                )
-                .map_err(|e| Error::Other(e.to_string()))?;
+                let partial =
+                    PartialSenderEcdhShare::new(secp, scan_key.0, vin, &normalized, &aux_rand)
+                        .map_err(|e| Error::Other(e.to_string()))?;
                 input.sp_ecdh_shares.insert(
                     *scan_key,
                     CompressedPublicKey(*partial.as_ecdh_shared_secret()),
@@ -251,7 +246,8 @@ impl SignerPsbtExt for Psbt {
                 .collect::<Vec<SilentPaymentKeyMaterial>>()
                 .as_slice(),
             &scan_key_to_shared_secret,
-        ).map_err(|e| Error::Other(e.to_string()))?;
+        )
+        .map_err(|e| Error::Other(e.to_string()))?;
         Ok(res_map)
     }
 
@@ -322,7 +318,10 @@ fn collect_scan_keys(
             let Some(x) = x else {
                 return None;
             };
-            Some(CompressedPublicKey::from_slice(&x.scan_key().serialize()).map_err(|e| Error::Other(e.to_string())))
+            Some(
+                CompressedPublicKey::from_slice(&x.scan_key().serialize())
+                    .map_err(|e| Error::Other(e.to_string())),
+            )
         })
         .collect()
 }
@@ -336,7 +335,8 @@ fn sp_info_to_key_material(sp_info: &[u8]) -> Result<SilentPaymentKeyMaterial> {
             sp_info.len()
         )));
     }
-    let scan_key = PublicKey::from_slice(&sp_info[..33]).map_err(|e| Error::Other(e.to_string()))?;
+    let scan_key =
+        PublicKey::from_slice(&sp_info[..33]).map_err(|e| Error::Other(e.to_string()))?;
     let m_pubkey =
         PublicKey::from_slice(&sp_info[33..]).map_err(|e| Error::Other(e.to_string()))?;
     Ok(SilentPaymentKeyMaterial::new(
