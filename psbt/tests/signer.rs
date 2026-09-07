@@ -6,20 +6,32 @@
 //!   2. Regression for multi-signer skipping non-eligible inputs in `compute_sp_outputs`.
 //!   3. BIP-352 n-counter correctness: two outputs to the same scan key produce distinct keys.
 //!   4. Unit tests for `extract_eligible_input_pubkey` covering all declared script types.
-//!   5. Known-failing case documenting the outstanding `is_partial` detection bug when
-//!      `compute_sp_outputs` is called in multi-signer mode with mixed eligible/non-eligible inputs.
+//!   5. Multi-signer `compute_sp_outputs` with mixed eligible/non-eligible inputs
+//!      (regression for the `is_partial` detection bug).
+//!   6. `sign_sp_inputs` produces a valid Schnorr signature over an SP input.
+//!   7. Receiver-verified end-to-end: the recipient can scan the derived SP outputs
+//!      (single-signer with an SP input, and two-party multi-signer aggregation).
+
+use std::collections::HashSet;
 
 use bitcoin::bip32::{DerivationPath, Fingerprint};
 use bitcoin::hashes::Hash;
 use bitcoin::key::TapTweak;
-use bitcoin::{Amount, CompressedPublicKey, OutPoint, ScriptBuf, Sequence, TxOut, Txid, XOnlyPublicKey};
+use bitcoin::sighash::{Prevouts, SighashCache};
+use bitcoin::{
+    Amount, CompressedPublicKey, OutPoint, ScriptBuf, Sequence, TxOut, Txid, XOnlyPublicKey,
+};
 use psbt::roles::signer::extract_eligible_input_pubkey;
 use psbt::roles::updater::Bip375UpdaterExt;
 use psbt::roles::{ConstructorPsbtExt, SignerPsbtExt};
 use psbt::Psbt;
 use psbt_v2::v2::{Input, Output};
-use secp256k1::{Parity, PublicKey, Scalar, Secp256k1, SecretKey};
+use secp256k1::{Message, Parity, PublicKey, Scalar, Secp256k1, SecretKey};
+use silentpayments::receiving::{Label, Receiver};
+use silentpayments::utils::receiving::PublicTweakData;
+use silentpayments::utils::OutPoint as SpOutPoint;
 use silentpayments::utils::NUMS_H;
+use silentpayments::{Network, SpVersion, TransactionInputs, TransactionSharedSecret};
 
 // ── test helpers ──────────────────────────────────────────────────────────────
 
@@ -61,11 +73,7 @@ fn sp_output(scan: &PublicKey, spend: &PublicKey) -> Output {
 
 /// Build a P2WPKH `Input` with `witness_utxo` and `bip32_derivations` populated so
 /// that `extract_eligible_input_pubkey` can identify and return the key.
-fn p2wpkh_input(
-    secp: &Secp256k1<secp256k1::All>,
-    outpoint: OutPoint,
-    secret: &SecretKey,
-) -> Input {
+fn p2wpkh_input(secp: &Secp256k1<secp256k1::All>, outpoint: OutPoint, secret: &SecretKey) -> Input {
     let public = secret.public_key(secp);
     let mut input = Input::new(&outpoint);
     input.sequence = Some(Sequence::MAX);
@@ -78,7 +86,99 @@ fn p2wpkh_input(
 }
 
 fn outpoint(vout: u32) -> OutPoint {
-    OutPoint::new(Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::all_zeros()), vout)
+    OutPoint::new(
+        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::all_zeros()),
+        vout,
+    )
+}
+
+/// Build an SP P2TR `Input`: the funding output key is `spend_sk + tweak·G` (placed
+/// directly, without a BIP-341 tweak), with `sp_tweak` and the BIP-376
+/// `sp_spend_bip32_derivations` entry (keyed by the *untweaked* spend key) populated.
+fn sp_p2tr_input(
+    secp: &Secp256k1<secp256k1::All>,
+    outpoint: OutPoint,
+    spend_sk: &SecretKey,
+    tweak: [u8; 32],
+) -> Input {
+    let tweaked = spend_sk
+        .add_tweak(&Scalar::from_be_bytes(tweak).unwrap())
+        .unwrap();
+    let (xonly, _) = tweaked.x_only_public_key(secp);
+    let mut input = Input::new(&outpoint);
+    input.sequence = Some(Sequence::MAX);
+    input.witness_utxo = Some(TxOut {
+        value: Amount::from_sat(20_000),
+        script_pubkey: ScriptBuf::new_p2tr_tweaked(xonly.dangerous_assume_tweaked()),
+    });
+    input.set_sp_tweak(tweak);
+    input.set_sp_spend_bip32_derivation(
+        CompressedPublicKey(spend_sk.public_key(secp)),
+        Fingerprint::default(),
+        DerivationPath::default(),
+    );
+    input
+}
+
+/// Rebuild the sender-side `TransactionInputs` exactly as `compute_sp_outputs` does.
+fn transaction_inputs_for(psbt: &Psbt) -> TransactionInputs {
+    let mut inputs = TransactionInputs::with_capacity(psbt.global.input_count);
+    for input in psbt.inputs.iter() {
+        let outpoint = SpOutPoint::from_txid_and_vout(
+            input.previous_txid.to_string(),
+            input.spent_output_index,
+        )
+        .unwrap();
+        let spk = input.funding_utxo().unwrap().script_pubkey.to_bytes();
+        let pubkey = extract_eligible_input_pubkey(input).unwrap();
+        inputs.push(outpoint, spk, pubkey);
+    }
+    inputs
+}
+
+/// Receiver-side verification: the recipient holding `scan_sk` must find every SP output
+/// of the PSBT via the public tweak data. This is the assertion that distinguishes a
+/// *correct* derived output key from merely *a* P2TR key.
+fn assert_receiver_scan_finds_outputs(
+    secp: &Secp256k1<secp256k1::All>,
+    psbt: &Psbt,
+    scan_sk: &SecretKey,
+    spend_pk: &PublicKey,
+) {
+    let inputs = transaction_inputs_for(psbt);
+    let tweak_data = PublicTweakData::new(secp, &inputs).unwrap();
+    let shared_secret =
+        TransactionSharedSecret::new_from_public_tweak_data(secp, &tweak_data, scan_sk).unwrap();
+    let receiver = Receiver::new(
+        SpVersion::ZERO,
+        scan_sk.public_key(secp),
+        *spend_pk,
+        Label::new(*scan_sk, 0),
+        Network::Regtest,
+    )
+    .unwrap();
+
+    let sp_output_keys: Vec<XOnlyPublicKey> = psbt
+        .outputs
+        .iter()
+        .filter(|o| o.sp_v0_info.is_some())
+        .map(|o| {
+            assert!(o.script_pubkey.is_p2tr(), "SP output must be P2TR");
+            XOnlyPublicKey::from_slice(&o.script_pubkey.as_bytes()[2..]).unwrap()
+        })
+        .collect();
+    assert!(!sp_output_keys.is_empty());
+
+    let found = receiver
+        .scan_transaction(&shared_secret, &sp_output_keys)
+        .unwrap();
+    let found_keys: HashSet<&XOnlyPublicKey> = found.values().flat_map(|m| m.keys()).collect();
+    for key in &sp_output_keys {
+        assert!(
+            found_keys.contains(key),
+            "receiver must find SP output {key}"
+        );
+    }
 }
 
 // ── 1. Single-signer round-trip ───────────────────────────────────────────────
@@ -98,7 +198,8 @@ fn test_single_signer_e2e() {
     psbt = psbt.add_inputs(vec![outpoint(0)]).unwrap();
     psbt.inputs[0] = p2wpkh_input(&secp, outpoint(0), &spend_sk);
 
-    psbt.single_signer_generate_ecdh_shares(&secp, spend_sk).unwrap();
+    psbt.single_signer_generate_ecdh_shares(&secp, spend_sk)
+        .unwrap();
     assert!(!psbt.global.sp_ecdh_shares.is_empty());
     assert!(!psbt.global.sp_dleq_proofs.is_empty());
 
@@ -107,11 +208,19 @@ fn test_single_signer_e2e() {
 
     psbt.set_sp_scriptpubkey(xonly_map).unwrap();
 
-    let sp_out = psbt.outputs.iter().find(|o| o.sp_v0_info.is_some()).unwrap();
+    let sp_out = psbt
+        .outputs
+        .iter()
+        .find(|o| o.sp_v0_info.is_some())
+        .unwrap();
     assert!(
         sp_out.script_pubkey.is_p2tr(),
         "SP output must be a P2TR scriptPubKey"
     );
+
+    // Stronger than "is P2TR": the recipient must be able to scan the output.
+    let scan_sk = sk(2);
+    assert_receiver_scan_finds_outputs(&secp, &psbt, &scan_sk, &spend_pk);
 }
 
 /// A PSBT with no SP outputs must be a no-op: no shares written, no error.
@@ -128,7 +237,8 @@ fn test_single_signer_no_sp_outputs_is_noop() {
     psbt = psbt.add_inputs(vec![outpoint(0)]).unwrap();
     psbt.inputs[0] = p2wpkh_input(&secp, outpoint(0), &spend_sk);
 
-    psbt.single_signer_generate_ecdh_shares(&secp, spend_sk).unwrap();
+    psbt.single_signer_generate_ecdh_shares(&secp, spend_sk)
+        .unwrap();
     assert!(
         psbt.global.sp_ecdh_shares.is_empty(),
         "no shares expected when there are no SP outputs"
@@ -157,7 +267,8 @@ fn test_two_outputs_same_scan_key_produce_distinct_keys() {
     psbt = psbt.add_inputs(vec![outpoint(0)]).unwrap();
     psbt.inputs[0] = p2wpkh_input(&secp, outpoint(0), &spend_sk);
 
-    psbt.single_signer_generate_ecdh_shares(&secp, spend_sk).unwrap();
+    psbt.single_signer_generate_ecdh_shares(&secp, spend_sk)
+        .unwrap();
     let xonly_map = psbt.compute_sp_outputs(&secp).unwrap();
 
     // Both share the same 67-byte address key → single map entry, two output keys.
@@ -185,8 +296,13 @@ fn test_two_outputs_different_scan_keys() {
     psbt = psbt.add_inputs(vec![outpoint(0)]).unwrap();
     psbt.inputs[0] = p2wpkh_input(&secp, outpoint(0), &spend_sk);
 
-    psbt.single_signer_generate_ecdh_shares(&secp, spend_sk).unwrap();
-    assert_eq!(psbt.global.sp_ecdh_shares.len(), 2, "one share per scan key");
+    psbt.single_signer_generate_ecdh_shares(&secp, spend_sk)
+        .unwrap();
+    assert_eq!(
+        psbt.global.sp_ecdh_shares.len(),
+        2,
+        "one share per scan key"
+    );
 
     let xonly_map = psbt.compute_sp_outputs(&secp).unwrap();
     assert_eq!(xonly_map.len(), 2, "one map entry per distinct SP address");
@@ -210,8 +326,7 @@ fn test_multi_signer_share_generation_skips_non_eligible_input() {
     let scan_pk = pk(&secp, 2);
     let spend_pk = pk(&secp, 3);
 
-    let mut psbt =
-        Psbt::create_new_transaction(vec![sp_output(&scan_pk, &spend_pk)]).unwrap();
+    let mut psbt = Psbt::create_new_transaction(vec![sp_output(&scan_pk, &spend_pk)]).unwrap();
     psbt = psbt.add_inputs(vec![outpoint(0), outpoint(1)]).unwrap();
 
     // Input 0: eligible P2WPKH owned by spend_sk.
@@ -226,7 +341,8 @@ fn test_multi_signer_share_generation_skips_non_eligible_input() {
     });
     psbt.inputs[1] = nonelig;
 
-    psbt.multi_signer_generate_ecdh_shares(&secp, spend_sk).unwrap();
+    psbt.multi_signer_generate_ecdh_shares(&secp, spend_sk)
+        .unwrap();
 
     assert!(
         !psbt.inputs[0].sp_ecdh_shares.is_empty(),
@@ -251,8 +367,7 @@ fn test_single_signer_ignores_non_eligible_input() {
     let scan_pk = pk(&secp, 2);
     let spend_pk = pk(&secp, 3);
 
-    let mut psbt =
-        Psbt::create_new_transaction(vec![sp_output(&scan_pk, &spend_pk)]).unwrap();
+    let mut psbt = Psbt::create_new_transaction(vec![sp_output(&scan_pk, &spend_pk)]).unwrap();
     psbt = psbt.add_inputs(vec![outpoint(0), outpoint(1)]).unwrap();
 
     psbt.inputs[0] = p2wpkh_input(&secp, outpoint(0), &spend_sk);
@@ -264,12 +379,17 @@ fn test_single_signer_ignores_non_eligible_input() {
     });
     psbt.inputs[1] = nonelig;
 
-    psbt.single_signer_generate_ecdh_shares(&secp, spend_sk).unwrap();
+    psbt.single_signer_generate_ecdh_shares(&secp, spend_sk)
+        .unwrap();
     let xonly_map = psbt.compute_sp_outputs(&secp).unwrap();
     assert_eq!(xonly_map.len(), 1);
     psbt.set_sp_scriptpubkey(xonly_map).unwrap();
 
-    let sp_out = psbt.outputs.iter().find(|o| o.sp_v0_info.is_some()).unwrap();
+    let sp_out = psbt
+        .outputs
+        .iter()
+        .find(|o| o.sp_v0_info.is_some())
+        .unwrap();
     assert!(sp_out.script_pubkey.is_p2tr());
 }
 
@@ -394,8 +514,7 @@ fn test_multi_signer_compute_sp_outputs_with_non_eligible_input() {
     let scan_pk = pk(&secp, 2);
     let spend_pk = pk(&secp, 3);
 
-    let mut psbt =
-        Psbt::create_new_transaction(vec![sp_output(&scan_pk, &spend_pk)]).unwrap();
+    let mut psbt = Psbt::create_new_transaction(vec![sp_output(&scan_pk, &spend_pk)]).unwrap();
     psbt = psbt.add_inputs(vec![outpoint(0), outpoint(1)]).unwrap();
 
     psbt.inputs[0] = p2wpkh_input(&secp, outpoint(0), &spend_sk);
@@ -407,7 +526,8 @@ fn test_multi_signer_compute_sp_outputs_with_non_eligible_input() {
     });
     psbt.inputs[1] = nonelig;
 
-    psbt.multi_signer_generate_ecdh_shares(&secp, spend_sk).unwrap();
+    psbt.multi_signer_generate_ecdh_shares(&secp, spend_sk)
+        .unwrap();
 
     // This call currently fails: "No shares found".
     psbt.compute_sp_outputs(&secp).unwrap();
@@ -464,4 +584,142 @@ fn test_extract_p2tr_sp_tweak_without_derivation_map() {
 
     let result = extract_eligible_input_pubkey(&input).unwrap();
     assert_eq!(result, Some(xonly.public_key(Parity::Even)));
+}
+
+// ── 6. sign_sp_inputs ─────────────────────────────────────────────────────────
+
+/// Signing an SP input must produce a Schnorr signature that verifies against the
+/// output key from the funding scriptPubKey, over the key-spend sighash of the
+/// unsigned transaction.
+#[test]
+fn test_sign_sp_inputs_produces_valid_taproot_sig() {
+    let secp = secp();
+    let spend_sk = sk(1);
+    let scan_pk = pk(&secp, 2);
+    let spend_pk = pk(&secp, 3);
+    let tweak_bytes = sk(7).secret_bytes();
+
+    let mut psbt = Psbt::create_new_transaction(vec![sp_output(&scan_pk, &spend_pk)]).unwrap();
+    psbt = psbt.add_inputs(vec![outpoint(0)]).unwrap();
+    psbt.inputs[0] = sp_p2tr_input(&secp, outpoint(0), &spend_sk, tweak_bytes);
+
+    let signed_keys = psbt.sign_sp_inputs(&secp, spend_sk).unwrap();
+
+    let tweaked = spend_sk
+        .add_tweak(&Scalar::from_be_bytes(tweak_bytes).unwrap())
+        .unwrap();
+    let (output_key, _) = tweaked.x_only_public_key(&secp);
+    assert_eq!(signed_keys, vec![output_key]);
+
+    let sig = psbt.inputs[0]
+        .tap_key_sig
+        .expect("tap_key_sig must be set after signing");
+
+    // Verify the signature against the sighash of the unsigned transaction.
+    // (`Psbt::unsigned_tx` is private upstream; rebuild it from the PSBT fields.)
+    let tx = bitcoin::Transaction {
+        version: psbt.global.tx_version,
+        lock_time: psbt
+            .global
+            .fallback_lock_time
+            .unwrap_or(bitcoin::absolute::LockTime::ZERO),
+        input: psbt
+            .inputs
+            .iter()
+            .map(|i| bitcoin::TxIn {
+                previous_output: OutPoint::new(i.previous_txid, i.spent_output_index),
+                script_sig: ScriptBuf::new(),
+                sequence: i.sequence.unwrap_or(Sequence::MAX),
+                witness: bitcoin::Witness::new(),
+            })
+            .collect(),
+        output: psbt
+            .outputs
+            .iter()
+            .map(|o| TxOut {
+                value: o.amount,
+                script_pubkey: o.script_pubkey.clone(),
+            })
+            .collect(),
+    };
+    let prevouts = [psbt.inputs[0].witness_utxo.clone().unwrap()];
+    let sighash = SighashCache::new(&tx)
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), sig.sighash_type)
+        .unwrap();
+    secp.verify_schnorr(&sig.signature, &Message::from(sighash), &output_key)
+        .unwrap();
+}
+
+// ── 7. Receiver-verified end-to-end ──────────────────────────────────────────
+
+/// Full single-signer flow spending *from* an SP input (P2TR with `sp_tweak`):
+/// share generation must resolve the tweaked key, and the recipient must be able
+/// to scan the derived output. Exercises the taproot branch of
+/// `resolve_owned_eligible_key` / `NormalizedSecretKey` that P2WPKH-only tests miss.
+#[test]
+fn test_single_signer_sp_input_receiver_can_scan() {
+    let secp = secp();
+    let input_spend_sk = sk(1);
+    let scan_sk = sk(2);
+    let scan_pk = scan_sk.public_key(&secp);
+    let spend_pk = pk(&secp, 3);
+    let tweak_bytes = sk(7).secret_bytes();
+
+    let mut psbt = Psbt::create_new_transaction(vec![sp_output(&scan_pk, &spend_pk)]).unwrap();
+    psbt = psbt.add_inputs(vec![outpoint(0)]).unwrap();
+    psbt.inputs[0] = sp_p2tr_input(&secp, outpoint(0), &input_spend_sk, tweak_bytes);
+
+    psbt.single_signer_generate_ecdh_shares(&secp, input_spend_sk)
+        .unwrap();
+    let xonly_map = psbt.compute_sp_outputs(&secp).unwrap();
+    psbt.set_sp_scriptpubkey(xonly_map).unwrap();
+
+    assert_receiver_scan_finds_outputs(&secp, &psbt, &scan_sk, &spend_pk);
+}
+
+/// True two-party flow: each signer contributes per-input shares for their own
+/// input only, the PSBTs are merged (manually — no Combiner role exists yet), and
+/// the recipient can scan the resulting SP output.
+#[test]
+fn test_multi_signer_two_parties_receiver_can_scan() {
+    let secp = secp();
+    let alice_sk = sk(1);
+    let bob_sk = sk(4);
+    let scan_sk = sk(2);
+    let scan_pk = scan_sk.public_key(&secp);
+    let spend_pk = pk(&secp, 3);
+    let bob_tweak = sk(8).secret_bytes();
+
+    let base = {
+        let mut psbt = Psbt::create_new_transaction(vec![sp_output(&scan_pk, &spend_pk)]).unwrap();
+        psbt = psbt.add_inputs(vec![outpoint(0), outpoint(1)]).unwrap();
+        // Alice: plain P2WPKH input. Bob: SP P2TR input (taproot share path).
+        psbt.inputs[0] = p2wpkh_input(&secp, outpoint(0), &alice_sk);
+        psbt.inputs[1] = sp_p2tr_input(&secp, outpoint(1), &bob_sk, bob_tweak);
+        psbt
+    };
+
+    let mut psbt_alice = base.clone();
+    psbt_alice
+        .multi_signer_generate_ecdh_shares(&secp, alice_sk)
+        .unwrap();
+    let mut psbt_bob = base;
+    psbt_bob
+        .multi_signer_generate_ecdh_shares(&secp, bob_sk)
+        .unwrap();
+
+    // Each signer must contribute to their own input only.
+    assert!(!psbt_alice.inputs[0].sp_ecdh_shares.is_empty());
+    assert!(psbt_alice.inputs[1].sp_ecdh_shares.is_empty());
+    assert!(psbt_bob.inputs[0].sp_ecdh_shares.is_empty());
+    assert!(!psbt_bob.inputs[1].sp_ecdh_shares.is_empty());
+
+    // No Combiner role exists yet: merge the per-input fields manually.
+    psbt_alice.inputs[1].sp_ecdh_shares = psbt_bob.inputs[1].sp_ecdh_shares.clone();
+    psbt_alice.inputs[1].sp_dleq_proofs = psbt_bob.inputs[1].sp_dleq_proofs.clone();
+
+    let xonly_map = psbt_alice.compute_sp_outputs(&secp).unwrap();
+    psbt_alice.set_sp_scriptpubkey(xonly_map).unwrap();
+
+    assert_receiver_scan_finds_outputs(&secp, &psbt_alice, &scan_sk, &spend_pk);
 }
