@@ -1,6 +1,6 @@
 //! PSBT Signer Role
 //!
-//! This module extends the upstream [`psbt_v2::psbt::Signer`] with the two pieces of
+//! This module extends the upstream [`psbt_v2::Signer`] with the two pieces of
 //! the BIP-375 signer role it does not implement:
 //!
 //! - **ECDH share generation** ([`SpSignerExt::add_ecdh_shares`]): global shares for a
@@ -18,10 +18,9 @@ use std::fmt;
 
 use bitcoin::key::TweakedPublicKey;
 use bitcoin::{CompressedPublicKey, ScriptBuf, XOnlyPublicKey};
-use psbt_v2::psbt::{GetKey, KeyRequest, Psbt, Signer as UpstreamSigner};
 use psbt_v2::{
-    CommitSilentPaymentOutputsError, DetermineLockTimeError, FundingUtxoError, Input,
-    InvalidKeyError, SpV0Info,
+    CommitSilentPaymentOutputsError, DetermineLockTimeError, FundingUtxoError, GetKey, Input,
+    KeyRequest, Psbt, Signer as UpstreamSigner, SpV0Info,
 };
 use secp256k1::rand::{CryptoRng, RngCore};
 use secp256k1::{Parity, PublicKey, Scalar, Secp256k1, SecretKey, Signing, Verification};
@@ -39,8 +38,6 @@ use silentpayments::{
 pub enum SpSignerError {
     /// Funding UTXO missing or inconsistent for an input.
     FundingUtxo(FundingUtxoError),
-    /// Malformed `sp_v0_info` blob on an output.
-    InvalidSpV0Info(InvalidKeyError),
     /// An input is BIP-352-eligible but its pubkey cannot be named from the PSBT
     /// (e.g. P2WPKH without a matching `bip32_derivations` entry). The receiver
     /// will learn it from the finalized witness, so deriving without it would
@@ -90,7 +87,6 @@ impl fmt::Display for SpSignerError {
         use SpSignerError as E;
         match self {
             E::FundingUtxo(e) => write!(f, "funding utxo error: {e}"),
-            E::InvalidSpV0Info(e) => write!(f, "invalid sp_v0_info: {e}"),
             E::MissingInputPubkey { vin } => write!(
                 f,
                 "input {vin}: BIP-352 eligible but its pubkey cannot be named from the PSBT"
@@ -138,7 +134,6 @@ impl std::error::Error for SpSignerError {
         use SpSignerError as E;
         match self {
             E::FundingUtxo(e) => Some(e),
-            E::InvalidSpV0Info(e) => Some(e),
             E::SilentPayments(e) => Some(e),
             E::Secp256k1(e) => Some(e),
             _ => None,
@@ -149,12 +144,6 @@ impl std::error::Error for SpSignerError {
 impl From<FundingUtxoError> for SpSignerError {
     fn from(value: FundingUtxoError) -> Self {
         Self::FundingUtxo(value)
-    }
-}
-
-impl From<InvalidKeyError> for SpSignerError {
-    fn from(value: InvalidKeyError) -> Self {
-        Self::InvalidSpV0Info(value)
     }
 }
 
@@ -258,7 +247,7 @@ impl SpSignerExt for Psbt {
         R: RngCore + CryptoRng,
         K: GetKey,
     {
-        let scan_keys = collect_scan_keys(&collect_sp_v0_keys(self))?;
+        let scan_keys = collect_scan_keys(&collect_sp_v0_keys(self));
         if scan_keys.is_empty() {
             // No SP outputs: nothing to do.
             return Ok(Vec::new());
@@ -387,9 +376,9 @@ impl SpSignerExt for Psbt {
         let sorted_materials: Vec<SilentPaymentKeyMaterial> = sp_outputs
             .iter()
             .map(|(_, sp_info)| sp_info_to_key_material(sp_info))
-            .collect::<Result<_, _>>()?;
+            .collect();
 
-        let scan_keys = collect_scan_keys(&sp_outputs)?;
+        let scan_keys = collect_scan_keys(&sp_outputs);
 
         // The BIP-352 input set, exactly as the receiver rebuilds it.
         let mut transaction_inputs = TransactionInputs::with_capacity(self.global.input_count);
@@ -490,7 +479,7 @@ impl SpSignerExt for Psbt {
         // order coincides with index order, so popping per material is exact.
         let mut scripts = Vec::with_capacity(sp_outputs.len());
         for (index, sp_info) in sp_outputs {
-            let key_material = sp_info_to_key_material(&sp_info)?;
+            let key_material = sp_info_to_key_material(&sp_info);
             let keys = derived
                 .get_mut(&key_material)
                 .expect("every submitted recipient is derived");
@@ -523,29 +512,17 @@ impl SpSignerExt for Psbt {
 }
 
 /// Distinct scan keys among the SP outputs. It must be called with the output of `collect_sp_v0_keys`
-/// to garantee it is sorted. We still sort the keys before deduping to be sure.
-fn collect_scan_keys(
-    sp_v0_info: &[(usize, SpV0Info)],
-) -> Result<Vec<CompressedPublicKey>, InvalidKeyError> {
-    let mut res = sp_v0_info
-        .iter()
-        .map(|(_, x)| x.scan_key())
-        .collect::<Result<Vec<_>, _>>()?;
+/// to guarantee it is sorted. We still sort the keys before deduping to be sure.
+fn collect_scan_keys(sp_v0_info: &[(usize, SpV0Info)]) -> Vec<CompressedPublicKey> {
+    let mut res: Vec<_> = sp_v0_info.iter().map(|(_, x)| x.scan_key()).collect();
     res.sort_unstable();
     res.dedup();
-    Ok(res)
+    res
 }
 
-/// Build the v0 key material from the 66-byte `sp_v0_info` blob (scan key ‖ spend key,
-/// both compressed).
-fn sp_info_to_key_material(
-    sp_info: &SpV0Info,
-) -> Result<SilentPaymentKeyMaterial, InvalidKeyError> {
-    Ok(SilentPaymentKeyMaterial::new(
-        SpVersion::ZERO,
-        sp_info.scan_key()?.0,
-        sp_info.spend_key()?.0,
-    ))
+/// Build the v0 key material from the `sp_v0_info` scan and spend keys.
+fn sp_info_to_key_material(sp_info: &SpV0Info) -> SilentPaymentKeyMaterial {
+    SilentPaymentKeyMaterial::new(SpVersion::ZERO, sp_info.scan_key().0, sp_info.spend_key().0)
 }
 
 /// Collects all the sp v0 keys in psbt's outputs with their output index, already sorted according to BIP375
@@ -677,7 +654,7 @@ where
     }
 
     let get = |req: KeyRequest| -> Result<Option<SecretKey>, SpSignerError> {
-        keys.get_key(req, secp)
+        keys.get_key(&req, secp)
             .map(|opt| opt.map(|sk| sk.inner))
             .map_err(|e| SpSignerError::GetKey {
                 vin,
@@ -819,11 +796,11 @@ fn pubkey_matches_funding_script(
 /// Convert a `rust_dleq` proof into the PSBT-serializable proof type.
 ///
 /// Both are newtypes over the same 64-byte encoding.
-fn to_psbt_dleq(p: rust_dleq::DleqProof) -> psbt_v2::dleq::DleqProof {
-    psbt_v2::dleq::DleqProof(p.0)
+fn to_psbt_dleq(p: rust_dleq::DleqProof) -> psbt_v2::DleqProof {
+    psbt_v2::DleqProof(p.0)
 }
 
 /// Convert a PSBT-field DLEQ proof into the rust-dleq type used by `silentpayments`.
-fn to_rust_dleq(p: psbt_v2::dleq::DleqProof) -> rust_dleq::DleqProof {
+fn to_rust_dleq(p: psbt_v2::DleqProof) -> rust_dleq::DleqProof {
     rust_dleq::DleqProof(p.0)
 }

@@ -8,8 +8,7 @@ use std::path::PathBuf;
 
 use bitcoin::base64::prelude::{BASE64_STANDARD, Engine as _};
 use psbt::roles::SpSignerExt;
-use psbt_v2::SilentPaymentState;
-use psbt_v2::psbt::Psbt;
+use psbt_v2::{Psbt, SilentPaymentState};
 use secp256k1::Secp256k1;
 use serde::Deserialize;
 
