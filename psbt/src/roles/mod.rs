@@ -3,8 +3,8 @@
 //! Implements the PSBT roles defined in BIP-174/370/375:
 //! - Updater
 //! - Signer
-//! - SP Output Finalizer (`finalize_sp_outputs`) — BIP-352 output script derivation
-//! - Input Witness Finalizer (`InputWitnessFinalizerPsbtExt::finalize`) — delegates to rust-psbt's `Finalizer`
+//! - SP Output Finalizer (`SpSignerExt::commit_sp_outputs`): BIP-352 output script derivation
+//! - Input Finalizer: rust-psbt's `Finalizer`, used as is
 //! - Extractor
 //!
 //! ## TODO: Future Enhancements
@@ -15,8 +15,10 @@
 //!   - Would handle union of ECDH shares, DLEQ proofs, and signatures
 //!   - Conflict detection for same-field different-value scenarios
 
+pub mod extractor;
 pub mod signer;
 pub mod updater;
 
+pub use extractor::*;
 pub use signer::*;
 pub use updater::*;
