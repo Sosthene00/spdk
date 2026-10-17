@@ -1581,3 +1581,43 @@ fn test_session_rejects_signing_outside_declared_inputs() {
         "got {result:?}"
     );
 }
+
+/// Regression: `signs_p2tr` in `verify_before_signing` accepts a signed input whose only
+/// funding evidence is an unverified witness-only P2TR claim (`sp_p2tr_input` sets
+/// `witness_utxo` only), because `funding_output` passes such a claim through
+/// `funding_utxo_untrusted` → `funding_utxo`'s `(Some, None) => Ok` arm. The claim's mere
+/// presence flips the `UnverifiedPrevout` gate for every other unverifiable input from
+/// reject to accept, so integrators must not read `Ok(())` as proof that any P2TR prevout
+/// was verified — see the dependency NOTE at rust-psbt 2fb5abc `src/map/input.rs:487-495`.
+#[test]
+fn verify_before_signing_treats_witness_only_p2tr_claim_as_signs_p2tr() {
+    let secp = secp();
+    let alice_sk = sk(1);
+    let bob_sk = sk(4);
+    // Bob: witness-only, unverifiable, non-P2TR — the case the gate protects.
+    let mut bob = p2wpkh_input(&secp, outpoint(1), &bob_sk);
+    bob.non_witness_utxo = None;
+    // Alice: SP P2TR input provided only as a witness claim (no `non_witness_utxo`).
+    let alice = sp_p2tr_input(&secp, outpoint(0), &alice_sk, sk(7).secret_bytes());
+    let mut psbt = committed_two_party_psbt(&secp, (alice, &alice_sk), (bob, &bob_sk));
+
+    // The claim is the only P2TR evidence the signer sees.
+    assert!(psbt.inputs[0].non_witness_utxo.is_none());
+    assert!(psbt.inputs[0]
+        .witness_utxo
+        .as_ref()
+        .unwrap()
+        .script_pubkey
+        .is_p2tr());
+
+    // With the claim: accepted; the counterparty cannot distinguish this from a verified
+    // P2TR prevout, and any co-relayer can add the claim unilaterally.
+    psbt.verify_before_signing(&secp, &[0])
+        .expect("witness-only P2TR claim counts as signs_p2tr; gate skipped");
+
+    // Strip the claim: the same PSBT no longer passes, so the claim's presence alone
+    // flipped the gate decision.
+    psbt.inputs[0].witness_utxo = None;
+    let result = psbt.verify_before_signing(&secp, &[0]);
+    assert!(result.is_err(), "gate must fail without the claim, got {result:?}");
+}
