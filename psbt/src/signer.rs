@@ -285,6 +285,14 @@ pub trait SpSignerExt {
     ///   the derived one.
     /// - [`SpSignerError::UnverifiedPrevout`] if an input outside `signed_vins` has no
     ///   `non_witness_utxo` and none of `signed_vins` is P2TR.
+    ///
+    /// Warning: the P2TR exception is itself claim-based. `signs_p2tr` is computed via
+    /// `funding_output` over the signed inputs, which accepts a witness-only P2TR
+    /// `witness_utxo` unverified (rust-psbt's `funding_utxo_untrusted` passes it through).
+    /// A co-signer relaying the PSBT can strip a counterparty input's `non_witness_utxo`
+    /// and inject a P2TR `witness_utxo` to satisfy the exception, so `Ok(())` does not
+    /// prove any signer's P2TR prevout was verified. Compare other signers' funding
+    /// outputs against your own UTXO set before signing.
     /// - [`SpSignerError::MalformedInput`] if a signed index is out of range.
     fn verify_before_signing<C>(
         &self,
