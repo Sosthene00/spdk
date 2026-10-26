@@ -181,12 +181,12 @@ impl TwoKey {
     /// Rejects keys that cannot be materialized and stores the derived keys.
     fn new(scan: DescriptorSecretKey, spend: DescriptorSpendKey) -> Result<Self, Error> {
         let secp = secp256k1::Secp256k1::new();
-        let scan_secret = derive_secret_key(&secp, &scan)?;
+        let scan_secret = derive_secret_key(&secp, &scan).map_err(|e| role_error("scan", e))?;
         let spend_secret: Option<SecretKey>;
         let spend_pubkey: PublicKey;
         match spend {
             DescriptorSpendKey::Private(ref desc) => {
-                let secret = derive_secret_key(&secp, desc)?;
+                let secret = derive_secret_key(&secp, desc).map_err(|e| role_error("spend", e))?;
                 spend_pubkey = secret.public_key(&secp);
                 spend_secret = Some(secret);
             }
@@ -226,31 +226,33 @@ impl TwoKey {
     }
 }
 
+/// Prefixes a role-free `derive_secret_key` complaint with the key argument it concerns.
+fn role_error(role: &str, error: Error) -> Error {
+    match error {
+        Error::Unexpected(msg) => Error::Unexpected(format!("sp() {role} key: {msg}")),
+        other => other,
+    }
+}
+
 fn derive_secret_key<C: secp256k1::Signing>(
     secp: &secp256k1::Secp256k1<C>,
     descriptor_secret_key: &DescriptorSecretKey,
 ) -> Result<SecretKey, Error> {
     let secret = match descriptor_secret_key {
         DescriptorSecretKey::MultiXPrv(_) => {
-            return Err(Error::Unexpected(
-                "sp() spend key must not be multipath".to_string(),
-            ));
+            return Err(Error::Unexpected("must not be multipath".to_string()));
         }
         DescriptorSecretKey::XPrv(xprv) => {
             if xprv.wildcard != Wildcard::None {
-                return Err(Error::Unexpected(
-                    "sp() spend key must not contain a wildcard".to_string(),
-                ));
+                return Err(Error::Unexpected("must not contain a wildcard".to_string()));
             }
             xprv.xkey
                 .derive_priv(secp, &xprv.derivation_path)
                 .map(|derived| derived.private_key)
-                .map_err(|e| Error::Unexpected(format!("sp() spend key: {e}")))?
+                .map_err(|e| Error::Unexpected(format!("{e}")))?
         }
         DescriptorSecretKey::Single(s) if !s.key.compressed => {
-            return Err(Error::Unexpected(
-                "sp() spend key must be compressed".to_string(),
-            ));
+            return Err(Error::Unexpected("must be compressed".to_string()));
         }
         DescriptorSecretKey::Single(s) => s.key.inner,
     };
@@ -621,14 +623,15 @@ mod tests {
     #[test]
     fn invalid_wildcard() {
         let (xprv, xpub) = account_xkeys();
-        for desc in [
-            format!("sp({xprv}/*,{xpub})"),
-            format!("sp({xprv},{xpub}/*h)"),
-            format!("sp({xprv},{xprv}/*)"),
+        for (desc, role) in [
+            (format!("sp({xprv}/*,{xpub})"), "scan"),
+            (format!("sp({xprv},{xpub}/*h)"), "spend"),
+            (format!("sp({xprv},{xprv}/*)"), "spend"),
         ] {
             match Sp::from_str(&desc) {
                 Err(Error::Unexpected(msg)) => {
                     assert!(msg.contains("wildcard"), "{desc}: {msg}");
+                    assert!(msg.contains(&format!("sp() {role} key")), "{desc}: {msg}");
                 }
                 other => panic!("expected wildcard rejection for {desc}, got {other:?}"),
             }
@@ -643,7 +646,13 @@ mod tests {
 
     #[test]
     fn invalid_uncompressed_scan_key() {
-        assert!(Sp::from_str(&format!("sp({UNCOMPRESSED_WIF},{SPEND_PUB})")).is_err());
+        match Sp::from_str(&format!("sp({UNCOMPRESSED_WIF},{SPEND_PUB})")) {
+            Err(Error::Unexpected(msg)) => {
+                assert!(msg.contains("sp() scan key"), "{msg}");
+                assert!(!msg.contains("spend"), "{msg}");
+            }
+            other => panic!("expected uncompressed scan key rejection, got {other:?}"),
+        }
     }
 
     #[test]
