@@ -1,26 +1,18 @@
-use std::collections::HashSet;
-use std::ops::RangeInclusive;
-use std::pin::Pin;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use bitcoin::absolute::Height;
-use bitcoin::{Amount, BlockHash, OutPoint, Txid};
+use bitcoin::Txid;
 use electrum_streaming_client::response::{FullTx, HeaderResp};
 use electrum_streaming_client::{
     AsyncClient, ElectrumScriptHash, ElectrumScriptStatus, Event, request,
 };
-use futures::Stream;
 use futures::channel::mpsc::UnboundedReceiver;
 use log::{debug, info};
-use spdk_core::chain::{BoxedBlockData, ChainBackend, UtxoData};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-#[derive(Debug)]
+#[expect(unused, reason = "worker is used to keep the connection alive")]
 pub struct FrigateClient {
-    pub host_url: String,
     pub client: AsyncClient,
     pub events: UnboundedReceiver<Event>,
     pub worker: JoinHandle<Result<(), std::io::Error>>,
@@ -33,7 +25,6 @@ pub enum FrigateError {
     Connection(String),
     Timeout(String),
     Request(String),
-    Io(String),
 }
 
 type Result<T, E = FrigateError> = std::result::Result<T, E>;
@@ -44,7 +35,6 @@ impl std::fmt::Display for FrigateError {
             Self::Connection(msg) => write!(f, "connection error: {msg}"),
             Self::Timeout(msg) => write!(f, "request timeout: {msg}"),
             Self::Request(msg) => write!(f, "request error: {msg}"),
-            Self::Io(msg) => write!(f, "I/O error: {msg}"),
         }
     }
 }
@@ -60,15 +50,9 @@ impl FrigateClient {
         let (reader, writer) = stream.into_split();
         let (client, events, worker) = AsyncClient::new_tokio(reader, writer);
 
-        let worker = tokio::spawn(async move {
-            match worker.await {
-                Ok(()) => Ok(()),
-                Err(e) => Err(e),
-            }
-        });
+        let worker = tokio::spawn(worker);
 
         Ok(Self {
-            host_url: host_url.to_owned(),
             client,
             events,
             worker,
@@ -78,7 +62,7 @@ impl FrigateClient {
     }
 
     /// Sets a custom request timeout for this client.
-    #[must_use]
+    #[expect(unused, reason = "tbd")]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
@@ -158,6 +142,7 @@ impl FrigateClient {
         Ok(res)
     }
 
+    #[expect(unused, reason = "tbd")]
     pub async fn unsubscribe(&mut self, unsub_req: request::SpUnsubscribe) -> Result<()> {
         self.version().await?;
 
@@ -201,30 +186,5 @@ impl FrigateClient {
         .map_err(|_| FrigateError::Timeout("Script history request timed out".to_owned()))?
         .map_err(|e| FrigateError::Request(format!("Script history request failed: {e}")))?;
         Ok(res)
-    }
-}
-
-#[async_trait]
-impl ChainBackend for FrigateClient {
-    fn get_block_data_for_range(
-        &self,
-        _range: RangeInclusive<Height>,
-        _dust_limit: Amount,
-        _with_cutthrough: bool,
-    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<BoxedBlockData>> + Send>> {
-        unimplemented!("Not needed for frigate implementation")
-    }
-
-    async fn detect_spent_outpoints(
-        &self,
-        _block_height: Height,
-        _block_hash: BlockHash,
-        _outpoints: HashSet<OutPoint>,
-    ) -> anyhow::Result<HashSet<OutPoint>> {
-        unimplemented!("Not needed for frigate implementation")
-    }
-
-    async fn utxos(&self, _block_height: Height) -> anyhow::Result<Vec<UtxoData>> {
-        unimplemented!("Not needed for frigate implementation")
     }
 }

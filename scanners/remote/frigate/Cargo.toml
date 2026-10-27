@@ -15,7 +15,6 @@ bitcoin.workspace = true
 futures.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 log.workspace = true
-async-trait.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]

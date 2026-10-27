@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use bitcoin::absolute::Height;
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::{BlockHash, Network, OutPoint};
-use frigate::Client;
 use frigate::Scanner;
 use spdk_core::scanner::{DiscoveredOutput, Scanner as _};
 use spdk_wallet::client::{SpClient, SpendKey};
@@ -33,12 +32,17 @@ async fn main() -> anyhow::Result<()> {
     let scan_sk = SecretKey::from_slice(&SCAN_SK_BYTES)?;
     let spend_sk = SecretKey::from_slice(&SPEND_SK_BYTES)?;
 
-    let frigate_client = Client::connect(FRIGATE_BACKEND_URL).await?;
-
     let sp_client = SpClient::new(scan_sk, SpendKey::Secret(spend_sk), NETWORK)?;
     let sp_receiver = sp_client.receiver();
 
-    let frigate_scanner = Scanner::new(frigate_client, scan_sk, sp_receiver, None, HashSet::new());
+    let frigate_scanner = Scanner::new(
+        FRIGATE_BACKEND_URL.to_owned(),
+        scan_sk,
+        sp_receiver,
+        None,
+        HashSet::new(),
+    )
+    .await?;
 
     println!("Receiving code for this key pair + network:");
     println!("{}", sp_client.receiving_code());
@@ -46,6 +50,8 @@ async fn main() -> anyhow::Result<()> {
     let start = Height::from_consensus(SCAN_START_HEIGHT)?;
     let end = Height::from_consensus(SCAN_END_HEIGHT)?;
 
+    // It's important to note that `scan_blocks` will not monitor scripts outputs.
+    // Call `scan_blocks_with_spent_outputs` instead if you want to monitor spent outputs as well.
     let mut rx = frigate_scanner.scan_blocks(start..=end);
 
     while let Ok(update) = rx.recv().await {
