@@ -1,19 +1,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bitcoin::absolute::Height;
-use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
+use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid, XOnlyPublicKey};
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::{ElectrumScriptHash, Event, request};
 use futures::channel::mpsc::{Receiver, channel};
 use futures::{SinkExt as _, StreamExt as _};
-use log::{debug, error, info};
-use silentpayments::SharedSecret;
-use silentpayments::receiving::{Label, Receiver as SpReceiver};
+use log::{debug, error, info, warn};
+use silentpayments::receiving::Receiver as SpReceiver;
 use silentpayments::utils::receiving::{
     calculate_ecdh_shared_secret, generate_script_pubkey_from_output_key,
 };
-use spdk_core::chain::UtxoData;
 use spdk_core::scanner::{DiscoveredOutput, ScanResult, Scanner};
 
 use crate::client::FrigateClient;
@@ -27,20 +25,21 @@ pub struct FrigateScanner {
 }
 
 impl FrigateScanner {
-    pub const fn new(
-        client: FrigateClient,
+    pub async fn new(
+        host_url: String,
         b_scan: SecretKey,
         sp_receiver: SpReceiver,
         labels: Option<Vec<u32>>,
         owned_outpoints: HashSet<OutPoint>,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let client = FrigateClient::connect(&host_url).await?;
+        Ok(Self {
             client,
             b_scan,
             sp_receiver,
             labels,
             owned_outpoints,
-        }
+        })
     }
 
     /// Starts a scan and keeps listening for confirmed spends of discovered outputs.
@@ -83,6 +82,7 @@ impl FrigateScanner {
             let mut scan_tx = Some(scan_tx);
             let mut tracked_scripts: HashMap<ElectrumScriptHash, HashSet<OutPoint>> =
                 HashMap::new();
+            let mut inspected_txids: HashMap<ElectrumScriptHash, HashSet<Txid>> = HashMap::new();
 
             match self.client.subscribe(subscribe_params).await {
                 Ok(sp_address) => info!("Subscribed to silent payments address {sp_address}"),
@@ -141,20 +141,22 @@ impl FrigateScanner {
                                 let full_tx = match self.client.get_transaction(txid).await {
                                     Ok(full_tx) => full_tx,
                                     Err(e) => {
-                                        error!("Unable to fetch transaction {txid}: {e}");
-                                        return;
+                                        warn!(
+                                            "Skipping transaction {txid} after fetch failure: {e}"
+                                        );
+                                        continue;
                                     }
                                 };
                                 let discovered_outputs = match process_outputs(
                                     &full_tx.tx,
                                     &self.b_scan,
                                     &self.sp_receiver,
-                                    &[tweak],
+                                    &tweak,
                                 ) {
                                     Ok(outputs) => outputs,
                                     Err(e) => {
-                                        error!("Unable to process transaction {txid}: {e}");
-                                        return;
+                                        warn!("Skipping malformed transaction {txid}: {e}");
+                                        continue;
                                     }
                                 };
 
@@ -209,6 +211,7 @@ impl FrigateScanner {
                             &mut self.client,
                             script_hash,
                             &tracked_scripts,
+                            &mut inspected_txids,
                         )
                         .await
                         {
@@ -287,23 +290,31 @@ async fn confirmed_spent_outpoints(
     client: &mut FrigateClient,
     script_hash: ElectrumScriptHash,
     tracked_scripts: &HashMap<ElectrumScriptHash, HashSet<OutPoint>>,
+    inspected_txids: &mut HashMap<ElectrumScriptHash, HashSet<Txid>>,
 ) -> anyhow::Result<HashSet<OutPoint>> {
     let Some(owned_outpoints) = tracked_scripts.get(&script_hash) else {
         return Ok(HashSet::new());
     };
 
+    let inspected_for_script = inspected_txids.entry(script_hash).or_default();
     let mut spent = HashSet::new();
     for history_entry in client.get_history(script_hash).await? {
         if history_entry.confirmation_height().is_none() {
             continue;
         }
 
-        let full_tx = client.get_transaction(history_entry.txid()).await?;
+        let txid = history_entry.txid();
+        if inspected_for_script.contains(&txid) {
+            continue;
+        }
+
+        let full_tx = client.get_transaction(txid).await?;
         for input in full_tx.tx.input {
             if owned_outpoints.contains(&input.previous_output) {
                 spent.insert(input.previous_output);
             }
         }
+        inspected_for_script.insert(txid);
     }
 
     Ok(spent)
@@ -313,9 +324,9 @@ fn process_outputs(
     tx: &Transaction,
     b_scan: &SecretKey,
     sp_receiver: &SpReceiver,
-    tweaks: &[PublicKey],
+    tweak: &PublicKey,
 ) -> anyhow::Result<HashMap<OutPoint, DiscoveredOutput>> {
-    let secret_map = output_key_to_secret_map(b_scan, sp_receiver, tweaks.to_owned())?;
+    let secret = calculate_ecdh_shared_secret(tweak, b_scan);
     let txid: Txid = tx.compute_txid();
     let outputs_to_check = tx
         .output
@@ -327,87 +338,40 @@ fn process_outputs(
                 .map_err(|e| anyhow::anyhow!("invalid Taproot output key at index {idx}: {e}"))?;
             let vout = u32::try_from(idx)
                 .map_err(|e| anyhow::anyhow!("output index {idx} does not fit in u32: {e}"))?;
-            Ok(UtxoData {
-                txid,
-                vout,
-                value: txout.value,
-                output_key,
-                spent: false,
-            })
+            Ok((vout, txout.value, output_key))
         })
-        .collect::<anyhow::Result<Vec<UtxoData>>>()?;
+        .collect::<anyhow::Result<Vec<(u32, bitcoin::Amount, XOnlyPublicKey)>>>()?;
 
     let output_keys: Vec<XOnlyPublicKey> = outputs_to_check
         .iter()
-        .map(|utxo| utxo.output_key)
+        .map(|(_, _, output_key)| *output_key)
         .collect();
-
-    let mut scan_res: Vec<(Option<Label>, UtxoData, Scalar)> = vec![];
-    let secret = secret_map
-        .into_values()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Frigate tweak did not produce any output keys"))?;
 
     let ours = sp_receiver.scan_transaction(&secret, &output_keys)?;
 
-    for utxo in outputs_to_check {
-        if utxo.spent {
-            continue;
-        }
-
+    let mut res = HashMap::new();
+    for (vout, value, output_key) in outputs_to_check {
         for (label, map) in &ours {
-            if let Some(scalar) = map.get(&utxo.output_key) {
-                scan_res.push((label.clone(), utxo, *scalar));
+            if let Some(tweak) = map.get(&output_key) {
+                let outpoint = OutPoint { txid, vout };
+                let spk_bytes = generate_script_pubkey_from_output_key(output_key);
+                let script_pubkey = ScriptBuf::from_bytes(spk_bytes.to_vec());
+
+                res.insert(
+                    outpoint,
+                    DiscoveredOutput {
+                        txout: TxOut {
+                            value,
+                            script_pubkey,
+                        },
+                        tweak: *tweak,
+                        label: label.clone(),
+                    },
+                );
                 break;
             }
         }
     }
 
-    let mut res = HashMap::new();
-    for (label, utxo, tweak) in scan_res {
-        let outpoint = OutPoint {
-            txid: utxo.txid,
-            vout: utxo.vout,
-        };
-
-        let spk_bytes = generate_script_pubkey_from_output_key(utxo.output_key);
-        let script_pubkey = ScriptBuf::from_bytes(spk_bytes.to_vec());
-
-        let out = DiscoveredOutput {
-            txout: TxOut {
-                value: utxo.value,
-                script_pubkey,
-            },
-            tweak,
-            label,
-        };
-
-        res.insert(outpoint, out);
-    }
-
-    Ok(res)
-}
-
-pub fn output_key_to_secret_map(
-    b_scan: &SecretKey,
-    sp_receiver: &SpReceiver,
-    tweak_data_vec: Vec<PublicKey>,
-) -> anyhow::Result<HashMap<XOnlyPublicKey, SharedSecret>> {
-    let items: anyhow::Result<Vec<_>> = tweak_data_vec
-        .into_iter()
-        .map(|tweak| {
-            let secret = calculate_ecdh_shared_secret(&tweak, b_scan);
-            let output_keys = sp_receiver.generate_output_keys_from_shared_secret(&secret)?;
-
-            Ok((secret, output_keys.into_values()))
-        })
-        .collect();
-
-    let mut res = HashMap::new();
-    for (secret, spks) in items? {
-        for spk in spks {
-            res.insert(spk, secret);
-        }
-    }
     Ok(res)
 }
