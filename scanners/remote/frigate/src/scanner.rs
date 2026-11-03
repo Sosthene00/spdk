@@ -44,8 +44,12 @@ impl FrigateScanner {
 
     /// Starts a scan and keeps listening for confirmed spends of discovered outputs.
     ///
-    /// The scan receiver is closed when the historical scan reaches progress `1.0`. The spent
-    /// receiver remains open for subsequent script-hash notifications.
+    /// The scan receiver is closed when the historical scan reaches progress `1.0` or the
+    /// inclusive range end is reached, whichever comes first. The range end is enforced
+    /// client-side: the Frigate protocol only carries a start height, so history entries past
+    /// the end are dropped here. When the end equals the current tip (tip-sync usage) the
+    /// behavior is identical to a scan that runs until progress `1.0`. The spent receiver
+    /// remains open for subsequent script-hash notifications.
     pub fn scan_blocks_with_spent_outputs(
         self,
         range: std::ops::RangeInclusive<Height>,
@@ -62,6 +66,7 @@ impl FrigateScanner {
         range: std::ops::RangeInclusive<Height>,
         monitor_spent: bool,
     ) -> (Receiver<ScanResult>, Receiver<HashSet<OutPoint>>) {
+        let end_height = range.end().to_consensus_u32();
         let subscribe_params = request::SpSubscribe {
             scan_priv_key: self.b_scan,
             spend_pub_key: self.sp_receiver.receiving_code().m_pubkey(),
@@ -83,6 +88,7 @@ impl FrigateScanner {
             let mut tracked_scripts: HashMap<ElectrumScriptHash, HashSet<OutPoint>> =
                 HashMap::new();
             let mut inspected_txids: HashMap<ElectrumScriptHash, HashSet<Txid>> = HashMap::new();
+            let mut highest_confirmed_height: u32 = 0;
 
             match self.client.subscribe(subscribe_params).await {
                 Ok(sp_address) => info!("Subscribed to silent payments address {sp_address}"),
@@ -110,6 +116,15 @@ impl FrigateScanner {
                         for history in &histories {
                             if history.height == 0 {
                                 debug!("Skipping mempool transaction {}", history.tx_hash);
+                                continue;
+                            }
+
+                            highest_confirmed_height = highest_confirmed_height.max(history.height);
+                            if history.height > end_height {
+                                debug!(
+                                    "Skipping history transaction {} at height {} past range end {end_height}",
+                                    history.tx_hash, history.height
+                                );
                                 continue;
                             }
 
@@ -194,14 +209,22 @@ impl FrigateScanner {
                             }
                         }
 
-                        if progress >= 1.0f32 {
+                        // The server streams history ordered by height, so once the highest
+                        // confirmed height seen reaches the (client-enforced) range end the
+                        // inclusive range is fully covered even if the server's progress is
+                        // still below 1.0.
+                        if highest_confirmed_height >= end_height || progress >= 1.0f32 {
                             if !monitor_spent {
-                                info!("Scan completed!");
+                                info!(
+                                    "Range end {end_height} reached (highest confirmed height {highest_confirmed_height}, progress {progress}); scan complete, stopping early"
+                                );
                                 break;
                             }
 
                             if scan_tx.take().is_some() {
-                                info!("Scan completed, monitoring spent outputs");
+                                info!(
+                                    "Range end {end_height} reached (highest confirmed height {highest_confirmed_height}, progress {progress}), monitoring spent outputs"
+                                );
                             }
                         }
                     }
@@ -255,6 +278,13 @@ impl FrigateScanner {
 }
 
 impl Scanner for FrigateScanner {
+    /// Scans the inclusive `range` for silent payments outputs.
+    ///
+    /// The range end is enforced client-side (the Frigate protocol only carries a start
+    /// height): history entries past the end are dropped, and the scan stops as soon as the
+    /// end is reached or the server reports progress `1.0`. When the end equals the current
+    /// tip (tip-sync usage) the behavior is identical to before: the scan runs until
+    /// progress `1.0`.
     fn scan_blocks(self, range: std::ops::RangeInclusive<Height>) -> Receiver<ScanResult> {
         let (scan_rx, spent_rx) = self.start_scan(range, false);
         drop(spent_rx);
