@@ -877,7 +877,7 @@ fn drop_mempool_holding(
     mempool_holdings.retain(|_, holdings| !holdings.is_empty());
 }
 
-fn process_outputs(
+pub fn process_outputs(
     tx: &Transaction,
     b_scan: &SecretKey,
     sp_receiver: &SpReceiver,
