@@ -31,7 +31,6 @@ pub struct FrigateScanner {
     b_scan: SecretKey,
     sp_receiver: SpReceiver,
     labels: Option<Vec<u32>>,
-    owned_outpoints: HashSet<OutPoint>,
 }
 
 impl FrigateScanner {
@@ -40,7 +39,6 @@ impl FrigateScanner {
         b_scan: SecretKey,
         sp_receiver: SpReceiver,
         labels: Option<Vec<u32>>,
-        owned_outpoints: HashSet<OutPoint>,
     ) -> anyhow::Result<Self> {
         let client = FrigateClient::connect(&host_url).await?;
         Ok(Self {
@@ -48,7 +46,6 @@ impl FrigateScanner {
             b_scan,
             sp_receiver,
             labels,
-            owned_outpoints,
         })
     }
 
@@ -222,15 +219,21 @@ impl FrigateScanner {
                                     }
                                 };
 
-                                self.owned_outpoints.extend(discovered_outputs.keys());
-
-                                if monitor_spent {
-                                    subscribe_outputs(
+                                if monitor_spent
+                                    && let Err(e) = subscribe_outputs(
                                         &mut self.client,
                                         &mut tracked_scripts,
                                         &discovered_outputs,
+                                        &mut inspected_txids,
+                                        &mut spent_tx,
+                                        monitor_spent,
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    error!(
+                                        "Unable to subscribe discovered output scripts / sweep pre-subscription spends: {e}; stopping monitor"
+                                    );
+                                    return;
                                 }
 
                                 let scan_res = ScanResult {
@@ -289,16 +292,24 @@ impl FrigateScanner {
                                 continue;
                             }
 
-                            self.owned_outpoints.extend(discovered_outputs.keys());
                             // Their scripts must be tracked so the confirmation (and any
                             // later spend) arrives via the existing script-hash
                             // notifications.
-                            subscribe_outputs(
+                            if let Err(e) = subscribe_outputs(
                                 &mut self.client,
                                 &mut tracked_scripts,
                                 &discovered_outputs,
+                                &mut inspected_txids,
+                                &mut spent_tx,
+                                monitor_spent,
                             )
-                            .await;
+                            .await
+                            {
+                                error!(
+                                    "Unable to subscribe discovered output scripts / sweep pre-subscription spends: {e}; stopping monitor"
+                                );
+                                return;
+                            }
 
                             if !monitor_spent {
                                 debug!(
@@ -431,8 +442,6 @@ impl FrigateScanner {
                             continue;
                         }
 
-                        self.owned_outpoints
-                            .retain(|outpoint| !spent.contains(outpoint));
                         for outpoints in tracked_scripts.values_mut() {
                             outpoints.retain(|outpoint| !spent.contains(outpoint));
                         }
@@ -481,11 +490,35 @@ impl Scanner for FrigateScanner {
     }
 }
 
+/// Subscribes to the script hash of every discovered output and tracks its outpoints.
+///
+/// For a script tracked for the first time, the first successful
+/// `scripthash_subscribe` is immediately followed by a confirmed-spend sweep: the
+/// script's confirmed history is fetched and `confirmed_spent_outpoints` is run over
+/// it, any already-spent outpoints are removed from `tracked_scripts`, and the result
+/// is forwarded on the spent channel exactly like a notification-driven spend (monitor
+/// mode only). The sweep runs once per newly tracked script: the Frigate protocol
+/// reports a script's pre-existing history only in the subscribe response (`Some`
+/// status means the script already has history) and does not re-notify it, so without
+/// this sweep the output of a rescan/recovery scenario that was spent long ago would
+/// stay tracked as spendable.
+///
+/// Scope of the sweep: it covers confirmed spends that pre-date the subscription.
+/// Spends inside the historical scan window after a discovery are NOT covered by this
+/// path — the local scanner covers those via block inputs, the frigate path does not.
+///
+/// Subscribe, history-fetch, and sweep errors are logged and skipped (the script stays
+/// tracked; a later script-hash notification re-runs spend detection for it). Only a
+/// failure to forward a spend on the spent channel is fatal, matching the
+/// notification-driven spend path.
 async fn subscribe_outputs(
     client: &mut FrigateClient,
     tracked_scripts: &mut HashMap<ElectrumScriptHash, HashSet<OutPoint>>,
     discovered_outputs: &HashMap<OutPoint, DiscoveredOutput>,
-) {
+    inspected_txids: &mut HashMap<ElectrumScriptHash, HashSet<Txid>>,
+    spent_tx: &mut Sender<HashSet<OutPoint>>,
+    monitor_spent: bool,
+) -> anyhow::Result<()> {
     for (outpoint, output) in discovered_outputs {
         let script_hash = ElectrumScriptHash::from(output.txout.script_pubkey.as_script());
         let first_output_for_script = !tracked_scripts.contains_key(&script_hash);
@@ -499,10 +532,63 @@ async fn subscribe_outputs(
         }
 
         let request = request::ScriptHashSubscribe { script_hash };
-        if let Err(e) = client.scripthash_subscribe(request).await {
-            error!("Unable to subscribe to script hash {script_hash}: {e}");
+        match client.scripthash_subscribe(request).await {
+            // A `Some` status means the script already has history: its
+            // pre-subscription transactions will not re-notify, hence the sweep below.
+            Ok(status) => {
+                debug!(
+                    "Subscribed to script hash {script_hash} (already had history: {})",
+                    status.is_some()
+                );
+            }
+            Err(e) => {
+                error!("Unable to subscribe to script hash {script_hash}: {e}");
+                continue;
+            }
+        }
+
+        if !monitor_spent {
+            continue;
+        }
+
+        let history = match client.get_history(script_hash).await {
+            Ok(history) => history,
+            Err(e) => {
+                error!("Unable to inspect history for script hash {script_hash}: {e}");
+                continue;
+            }
+        };
+        let spent = match confirmed_spent_outpoints(
+            client,
+            &history,
+            script_hash,
+            tracked_scripts,
+            inspected_txids,
+        )
+        .await
+        {
+            Ok(spent) => spent,
+            Err(e) => {
+                error!("Unable to inspect transactions for script hash {script_hash}: {e}");
+                continue;
+            }
+        };
+
+        if spent.is_empty() {
+            continue;
+        }
+
+        if let Some(outpoints) = tracked_scripts.get_mut(&script_hash) {
+            outpoints.retain(|outpoint| !spent.contains(outpoint));
+        }
+        tracked_scripts.retain(|_, outpoints| !outpoints.is_empty());
+
+        if let Err(e) = spent_tx.send(spent).await {
+            return Err(anyhow::anyhow!("failed to forward spent outputs: {e}"));
         }
     }
+
+    Ok(())
 }
 
 async fn confirmed_spent_outpoints(
