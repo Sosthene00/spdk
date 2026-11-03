@@ -4,7 +4,7 @@ members = [
   "backends/blindbit-v1",
   "spdk-wallet",
   "silentpayments",
-  "scanners/local", 
+  "scanners/local",
   "scanners/remote/frigate",
 ]
 resolver = "3"

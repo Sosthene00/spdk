@@ -1,3 +1,10 @@
+//! `frigate` — remote silent-payment scanner backend for spdk, speaking the
+//! Frigate electrum extension through the electrum streaming client (ESC).
+//!
+//! See the crate `README.md` for usage and — before pointing this at
+//! anything but a trusted server — the trust model: the scan private key is
+//! sent to the server.
+
 mod client;
 mod scanner;
 
