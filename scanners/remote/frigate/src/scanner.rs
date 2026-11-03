@@ -61,16 +61,23 @@ impl FrigateScanner {
     /// script-hash subscription is the canonical source of confirmation height: once a
     /// held discovery's txid shows a confirmation height in its script's history, the
     /// discovery is emitted on the scan receiver with that height and the hash of the
-    /// block header at it, and the holding is dropped. Because such a confirmation
-    /// usually arrives after the historical scan has finished, the scan receiver in this
-    /// mode stays open instead of closing at the range end.
+    /// block header at it, and the holding is dropped.
+    ///
+    /// The scan receiver stays open in monitor mode and keeps delivering discoveries
+    /// for the life of the task: per the Frigate protocol, the first progress `1.0`
+    /// notification ends the historical scan and subsequent notifications are live
+    /// updates carrying newly found transactions, whose discoveries are forwarded on
+    /// the scan channel even at heights past the range end. The task ends when the
+    /// consumer drops the receiver (a send error stops the scan output while spent
+    /// monitoring keeps running). The spent receiver delivers confirmed spends of
+    /// discovered outputs over the same lifetime.
     ///
     /// The historical range is enforced client-side: the Frigate protocol only carries a
-    /// start height, so confirmed history entries past the inclusive end are dropped, and
-    /// the historical scan completes when the server reports progress `1.0` or the range
-    /// end is seen. When the end equals the current tip (tip-sync usage) the behavior is
-    /// identical to a scan that runs until progress `1.0`. The spent receiver remains
-    /// open for subsequent script-hash notifications.
+    /// start height, so confirmed history entries past the inclusive end are dropped
+    /// while the historical scan is running, and the historical scan completes when the
+    /// server reports progress `1.0` or the range end is seen. When the end equals the
+    /// current tip (tip-sync usage) the behavior is identical to a scan that runs until
+    /// progress `1.0`.
     pub fn scan_blocks_with_spent_outputs(
         self,
         range: std::ops::RangeInclusive<Height>,
@@ -118,6 +125,12 @@ impl FrigateScanner {
             let mut mempool_holdings: HashMap<ElectrumScriptHash, HashMap<Txid, MempoolHolding>> =
                 HashMap::new();
             let mut historical_scan_complete = false;
+            // Per the Frigate protocol, the first progress `1.0` notification ends the
+            // historical scan; subsequent notifications are live updates carrying newly
+            // found transactions. Once that boundary is crossed in monitor mode, the
+            // range-end filter no longer applies: live discoveries past the requested
+            // range end must still be delivered on the scan channel.
+            let mut live_updates = false;
 
             match self.client.subscribe(subscribe_params).await {
                 Ok(sub) => info!(
@@ -158,7 +171,7 @@ impl FrigateScanner {
                             }
 
                             highest_confirmed_height = highest_confirmed_height.max(history.height);
-                            if history.height > end_height {
+                            if history.height > end_height && !(monitor_spent && live_updates) {
                                 debug!(
                                     "Skipping history transaction {} at height {} past range end {end_height}",
                                     history.tx_hash, history.height
@@ -342,6 +355,14 @@ impl FrigateScanner {
                                     }
                                 }
                             }
+                        }
+
+                        // Per the Frigate protocol, the first progress `1.0` notification
+                        // ends the historical scan; the histories above were still
+                        // filtered by the range end, and from the next notification on,
+                        // monitor mode forwards every discovery (`live_updates` above).
+                        if progress >= 1.0f32 {
+                            live_updates = true;
                         }
 
                         // The server streams history ordered by height, so once the highest
