@@ -62,10 +62,11 @@ impl FrigateScanner {
         range: std::ops::RangeInclusive<Height>,
         monitor_spent: bool,
     ) -> (Receiver<ScanResult>, Receiver<HashSet<OutPoint>>) {
+        let requested_start = range.start().to_consensus_u32();
         let subscribe_params = request::SpSubscribe {
             scan_priv_key: self.b_scan,
             spend_pub_key: self.sp_receiver.receiving_code().m_pubkey(),
-            start_height: Some(range.start().to_consensus_u32()),
+            start_height: Some(requested_start),
             labels: self.labels,
         };
 
@@ -85,7 +86,10 @@ impl FrigateScanner {
             let mut inspected_txids: HashMap<ElectrumScriptHash, HashSet<Txid>> = HashMap::new();
 
             match self.client.subscribe(subscribe_params).await {
-                Ok(sub) => info!("Subscribed to silent payments address {}", sub.address),
+                Ok(sub) => info!(
+                    "subscribed: address={} start_height={} (requested {}) labels={:?}",
+                    sub.address, sub.start_height, requested_start, sub.labels
+                ),
                 Err(e) => {
                     error!("Unable to subscribe to silent payments: {e}");
                     return;
