@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::Txid;
@@ -7,9 +8,12 @@ use electrum_streaming_client::{
 };
 use futures::channel::mpsc::UnboundedReceiver;
 use log::{debug, info, warn};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::{self};
 
 /// Number of attempts per request before the failure is surfaced to the caller.
 const REQUEST_ATTEMPTS: u32 = 3;
@@ -82,28 +86,91 @@ impl std::fmt::Display for FrigateError {
 impl std::error::Error for FrigateError {}
 
 impl FrigateClient {
+    /// Connects to a Frigate electrum server.
+    ///
+    /// `host_url` is either `host:port` for a plain TCP connection (unchanged
+    /// behavior, no TLS handshake attempted) or `ssl://host:port` for TLS. The
+    /// scan private key crosses the wire on every subscribe, so endpoints
+    /// outside a trusted LAN must be reached over `ssl://`; TLS certificates
+    /// are verified against the webpki-roots public trust store with SNI taken
+    /// from the host part of the URL.
     pub async fn connect(host_url: &str) -> Result<Self> {
+        match host_url.strip_prefix("ssl://") {
+            Some(host) => Self::connect_tls(host).await,
+            None => Self::connect_plain(host_url).await,
+        }
+    }
+
+    /// Plain TCP connect: behavior identical to before TLS support existed.
+    async fn connect_plain(host_url: &str) -> Result<Self> {
         let stream = TcpStream::connect(host_url).await.map_err(|err| {
             FrigateError::Connection(format!("can't connect to socket '{host_url}': {err}"))
         })?;
 
         let (reader, writer) = stream.into_split();
+        Ok(Self::new(reader, writer))
+    }
+
+    /// TLS connect for the host part of an `ssl://host:port` URL (the prefix
+    /// is already stripped). Plain TCP is wrapped with rustls; the negotiated
+    /// TLS stream is split into read/write halves for the streaming client.
+    async fn connect_tls(host: &str) -> Result<Self> {
+        let (server_name, port) = host.rsplit_once(':').ok_or_else(|| {
+            FrigateError::Connection(format!("ssl:// URL '{host}' must be 'ssl://host:port'"))
+        })?;
+        let port: u16 = port.parse().map_err(|err| {
+            FrigateError::Connection(format!("invalid port in ssl:// URL '{host}': {err}"))
+        })?;
+
+        let stream = TcpStream::connect((server_name, port))
+            .await
+            .map_err(|err| {
+                FrigateError::Connection(format!("can't connect to socket '{host}': {err}"))
+            })?;
+
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+        let server_name = ServerName::try_from(server_name.to_owned()).map_err(|err| {
+            FrigateError::Connection(format!("invalid TLS server name '{server_name}': {err}"))
+        })?;
+
+        let tls = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|err| {
+                FrigateError::Connection(format!("TLS handshake with '{host}' failed: {err}"))
+            })?;
+
+        let (reader, writer) = tokio::io::split(tls);
+        Ok(Self::new(reader, writer))
+    }
+
+    fn new<R, W>(reader: R, writer: W) -> Self
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
         let (client, events, worker) = AsyncClient::new_tokio(reader, writer);
 
         let worker = tokio::spawn(worker);
 
-        Ok(Self {
+        Self {
             client,
             events,
             worker,
             request_timeout: Duration::from_secs(10),
             protocol_version: None,
             consecutive_tx_fetch_failures: 0,
-        })
+        }
     }
 
     /// Sets a custom request timeout for this client.
-    #[expect(unused, reason = "tbd")]
+    #[must_use]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
@@ -195,7 +262,6 @@ impl FrigateClient {
         Ok(res)
     }
 
-    #[expect(unused, reason = "tbd")]
     pub async fn unsubscribe(&mut self, unsub_req: request::SpUnsubscribe) -> Result<()> {
         self.version().await?;
 
