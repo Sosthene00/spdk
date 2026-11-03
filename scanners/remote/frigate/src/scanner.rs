@@ -6,6 +6,7 @@ use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid, XOnlyPublicKey};
 use backend_frigate::FrigateClient;
 use electrum_streaming_client::notification::Notification;
+use electrum_streaming_client::response::SpSubscribeResp;
 use electrum_streaming_client::{ElectrumScriptHash, Event, request, response};
 use futures::channel::mpsc::{Receiver, Sender, channel};
 use futures::{SinkExt as _, StreamExt as _};
@@ -75,14 +76,14 @@ impl FrigateScanner {
     /// connection: the previous client is dropped (its worker aborted) because
     /// its connect or subscribe failed.
     ///
-    /// Returns `Ok(())` on the successful attempt, or the last
+    /// Returns the subscribe response of the successful attempt, or the last
     /// error after all attempts failed; the caller then logs
     /// `frigate scan failed permanently: <e>` and ends the scan, closing the
     /// receivers.
     async fn connect_and_subscribe(
         &mut self,
         requested_start: u32,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SpSubscribeResp> {
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 1..=SUBSCRIBE_ATTEMPTS {
             if attempt > 1 {
@@ -109,8 +110,11 @@ impl FrigateScanner {
             };
             match self.client.subscribe(subscribe_params).await {
                 Ok(sub) => {
-                    info!("subscribed: address={sub} (requested {requested_start})");
-                    return Ok(());
+                    info!(
+                        "subscribed: address={} start_height={} (requested {requested_start}) labels={:?}",
+                        sub.address, sub.start_height, sub.labels
+                    );
+                    return Ok(sub);
                 }
                 Err(e) => {
                     let err = anyhow::anyhow!(

@@ -1,6 +1,5 @@
-//! Smoke test: prove the silent-payments subscribe works against a live
-//! Frigate electrum server (1.4.1 bare-string subscribe response), over plain
-//! TCP or TLS (`ssl://` URL).
+//! Smoke test: prove the typed silent-payments subscribe works against a live
+//! Frigate/Friglet electrum server, over plain TCP or TLS (`ssl://` URL).
 //!
 //! Throwaway keys only (scan key = all-ones, spend key = secp256k1 generator): the
 //! server scan finds nothing, so an empty history IS the expected pass shape.
@@ -55,8 +54,7 @@ async fn main() -> anyhow::Result<()> {
     let scan_priv_key = SecretKey::from_slice(&SCAN_SK_BYTES)?;
     let spend_pub_key = PublicKey::from_str(SPEND_PK)?;
     let start_height = tip_height.saturating_sub(5);
-    // frigate <= 1.4.1 answers SpSubscribe with the bare address string.
-    let address: String = frigate_client
+    let sub = frigate_client
         .client
         .send_request(request::SpSubscribe {
             scan_priv_key,
@@ -65,7 +63,12 @@ async fn main() -> anyhow::Result<()> {
             labels: None,
         })
         .await?;
-    println!("SpSubscribe response -> address={address}");
+    let address = sub.address;
+    let labels = sub.labels;
+    let resp_start_height = sub.start_height;
+    println!(
+        "SpSubscribeResp -> address={address} labels={labels:?} start_height={resp_start_height}"
+    );
 
     // Move the event receiver out for the wait; the worker handle stays
     // reachable on the partially-moved client for the abort below.
