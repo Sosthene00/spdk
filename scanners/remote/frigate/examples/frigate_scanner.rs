@@ -40,7 +40,6 @@ async fn main() -> anyhow::Result<()> {
         scan_sk,
         sp_receiver,
         None,
-        HashSet::new(),
     )
     .await?;
 

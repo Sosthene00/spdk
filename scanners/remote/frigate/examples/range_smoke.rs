@@ -7,7 +7,6 @@
 //!
 //! Usage: `RUST_LOG=frigate=info FRIGATE_URL=127.0.0.1:50001 cargo run -q -p frigate --example range_smoke`
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use bitcoin::Network;
@@ -65,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     let sp_client = SpClient::new(scan_sk, SpendKey::Secret(spend_sk), NETWORK)?;
     let sp_receiver = sp_client.receiver();
 
-    let scanner = Scanner::new(url, scan_sk, sp_receiver, None, HashSet::new()).await?;
+    let scanner = Scanner::new(url, scan_sk, sp_receiver, None).await?;
     let mut rx = scanner.scan_blocks(
         Height::from_consensus(start_height)?..=Height::from_consensus(end_height)?,
     );
