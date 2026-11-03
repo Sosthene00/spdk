@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use bitcoin::absolute::Height;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid, XOnlyPublicKey};
+use backend_frigate::FrigateClient;
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::{ElectrumScriptHash, Event, request};
 use futures::channel::mpsc::{Receiver, channel};
@@ -14,7 +15,6 @@ use silentpayments::utils::receiving::{
 };
 use spdk_core::scanner::{DiscoveredOutput, ScanResult, Scanner};
 
-use crate::client::FrigateClient;
 
 pub struct FrigateScanner {
     client: FrigateClient,

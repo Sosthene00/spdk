@@ -1,0 +1,19 @@
+[package]
+name = "backend-frigate"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+electrum_streaming_client.workspace = true
+bitcoin.workspace = true
+futures.workspace = true
+log.workspace = true
+anyhow.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+
+[lints]
+workspace = true
