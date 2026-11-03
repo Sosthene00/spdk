@@ -7,6 +7,8 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+backend-frigate.workspace = true
+
 electrum_streaming_client.workspace = true
 spdk-core.workspace = true
 silentpayments.workspace = true

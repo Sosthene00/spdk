@@ -2,6 +2,7 @@
 members = [
   "spdk-core",
   "backends/blindbit-v1",
+  "backends/frigate",
   "spdk-wallet",
   "silentpayments",
   "scanners/local", 
@@ -15,6 +16,7 @@ spdk-core = { path = "spdk-core" }
 spdk-wallet = { path = "spdk-wallet" }
 silentpayments = { path = "silentpayments" }
 backend-blindbit-v1 = { path = "backends/blindbit-v1" }
+backend-frigate = { path = "backends/frigate" }
 local-scanner = { path = "scanners/local" }
 
 # Core dependencies - shared across crates
@@ -27,6 +29,8 @@ bitcoin = { version = "0.32.8", features = ["serde", "rand", "base64"] }
 bitcoin_hashes = "0.13.0"
 rayon = "1.10.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-rustls = "0.26"
+webpki-roots = "1.0"
 futures = "0.3"
 async-trait = "0.1"
 log = "0.4"
