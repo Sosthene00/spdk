@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use bitcoin::Txid;
-use electrum_streaming_client::response::{FullTx, HeaderResp};
+use electrum_streaming_client::response::{FullTx, HeaderResp, SpSubscribeResp};
 use electrum_streaming_client::{
     AsyncClient, ElectrumScriptHash, ElectrumScriptStatus, Event, request,
 };
@@ -126,7 +126,10 @@ impl FrigateClient {
     /// sent to the client everytime an ouput is found.
     ///
     /// See: <https://github.com/sparrowwallet/frigate#blockchainsilentpaymentssubscribe>
-    pub async fn subscribe(&mut self, subscribe_req: request::SpSubscribe) -> Result<String> {
+    pub async fn subscribe(
+        &mut self,
+        subscribe_req: request::SpSubscribe,
+    ) -> Result<SpSubscribeResp> {
         self.version().await?;
         debug!("Sending subscribe event request...");
 
@@ -138,7 +141,7 @@ impl FrigateClient {
         .map_err(|_| FrigateError::Timeout("Subscribe request timed out".to_owned()))?
         .map_err(|e| FrigateError::Request(format!("Subscribe request failed: {e}")))?;
 
-        info!("Subscribed to silent payment address: {res}");
+        info!("Subscribed to silent payment address: {}", res.address);
         Ok(res)
     }
 
