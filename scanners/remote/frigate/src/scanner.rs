@@ -85,7 +85,7 @@ impl FrigateScanner {
             let mut inspected_txids: HashMap<ElectrumScriptHash, HashSet<Txid>> = HashMap::new();
 
             match self.client.subscribe(subscribe_params).await {
-                Ok(sp_address) => info!("Subscribed to silent payments address {sp_address}"),
+                Ok(sub) => info!("Subscribed to silent payments address {}", sub.address),
                 Err(e) => {
                     error!("Unable to subscribe to silent payments: {e}");
                     return;
