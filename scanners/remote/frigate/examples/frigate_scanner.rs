@@ -8,7 +8,6 @@ use spdk_core::scanner::{DiscoveredOutput, Scanner as _};
 use spdk_wallet::client::{SpClient, SpendKey};
 
 const NETWORK: Network = Network::Signet;
-const FRIGATE_BACKEND_URL: &str = "100.81.213.115:50102";
 // scan range settings
 const SCAN_START_HEIGHT: u32 = 326_000;
 const SCAN_END_HEIGHT: u32 = 326_595;
@@ -35,8 +34,11 @@ async fn main() -> anyhow::Result<()> {
     let sp_client = SpClient::new(scan_sk, SpendKey::Secret(spend_sk), NETWORK)?;
     let sp_receiver = sp_client.receiver();
 
+    // The scan private key is sent to the server on every subscribe — only
+    // point FRIGATE_URL at servers you trust (see the crate README).
+    let frigate_url = std::env::var("FRIGATE_URL").unwrap_or_else(|_| "127.0.0.1:50001".to_owned());
     let frigate_scanner = Scanner::new(
-        FRIGATE_BACKEND_URL.to_owned(),
+        frigate_url,
         scan_sk,
         sp_receiver,
         None,
