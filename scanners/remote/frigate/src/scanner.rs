@@ -68,7 +68,8 @@ impl FrigateScanner {
         })
     }
 
-    /// Performs the whole scan setup — TCP connect plus silent-payment
+    /// Performs the whole scan setup — connection (plain TCP or `ssl://`
+    /// TLS) plus silent-payment
     /// subscribe — as one unit: one initial attempt plus
     /// [`SUBSCRIBE_RETRIES`] retries with a [`SUBSCRIBE_RETRY_BACKOFF`] sleep
     /// between attempts. Every attempt after the first uses a fresh
@@ -281,7 +282,8 @@ impl FrigateScanner {
                                     continue;
                                 }
 
-                                highest_confirmed_height = highest_confirmed_height.max(history.height);
+                                highest_confirmed_height =
+                                    highest_confirmed_height.max(history.height);
                                 if history.height > end_height && !(monitor_spent && live_updates) {
                                     debug!(
                                         "Skipping history transaction {} at height {} past range end {end_height}",
@@ -300,7 +302,9 @@ impl FrigateScanner {
                                 let blk_header = match self.client.get_block_header(height).await {
                                     Ok(header) => header,
                                     Err(e) => {
-                                        error!("Unable to fetch block header at height {height}: {e}");
+                                        error!(
+                                            "Unable to fetch block header at height {height}: {e}"
+                                        );
                                         return;
                                     }
                                 };
