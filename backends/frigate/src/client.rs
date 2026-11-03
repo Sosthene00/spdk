@@ -6,18 +6,58 @@ use electrum_streaming_client::{
     AsyncClient, ElectrumScriptHash, ElectrumScriptStatus, Event, request,
 };
 use futures::channel::mpsc::UnboundedReceiver;
-use log::{debug, info};
+use log::{debug, info, warn};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
-#[expect(unused, reason = "worker is used to keep the connection alive")]
+/// Number of attempts per request before the failure is surfaced to the caller.
+const REQUEST_ATTEMPTS: u32 = 3;
+/// Backoff before request retry `n`: `REQUEST_RETRY_BACKOFF * n`.
+const REQUEST_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Sends one request with the client's per-request timeout, retrying it up to
+/// [`REQUEST_ATTEMPTS`] attempts with a `REQUEST_RETRY_BACKOFF * attempt`
+/// backoff between attempts.
+///
+/// `$req` is re-evaluated on every attempt (`send_request` consumes the
+/// request), so it must be a cheap request-building expression.
+macro_rules! retry_request {
+    ($self:ident, $what:literal, $($req:tt)*) => {{
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let result = timeout($self.request_timeout, $self.client.send_request($($req)*))
+                .await
+                .map_err(|_| FrigateError::Timeout(format!("{} timed out", $what)))
+                .and_then(|response| {
+                    response.map_err(|e| FrigateError::Request(format!("{} failed: {e}", $what)))
+                });
+            match result {
+                Ok(response) => break Ok(response),
+                Err(err) => {
+                    if attempt >= REQUEST_ATTEMPTS {
+                        break Err(err);
+                    }
+                    warn!("{err}; retrying in {:?}", REQUEST_RETRY_BACKOFF * attempt);
+                    sleep(REQUEST_RETRY_BACKOFF * attempt).await;
+                }
+            }
+        }
+    }};
+}
+
 pub struct FrigateClient {
     pub client: AsyncClient,
     pub events: UnboundedReceiver<Event>,
     pub worker: JoinHandle<Result<(), std::io::Error>>,
     pub request_timeout: Duration,
     protocol_version: Option<String>,
+    /// Consecutive `get_transaction` calls whose request retries were all
+    /// exhausted; every successful fetch resets it to zero. The scanner ends
+    /// the scan task when the count exceeds ten, treating the connection as
+    /// broken (see `FrigateScanner`'s failure semantics).
+    consecutive_tx_fetch_failures: u32,
 }
 
 #[derive(Debug)]
@@ -58,6 +98,7 @@ impl FrigateClient {
             worker,
             request_timeout: Duration::from_secs(10),
             protocol_version: None,
+            consecutive_tx_fetch_failures: 0,
         })
     }
 
@@ -68,30 +109,39 @@ impl FrigateClient {
         self
     }
 
+    /// Number of consecutive `get_transaction` calls whose request retries
+    /// were all exhausted (a successful fetch resets the count to zero).
+    pub const fn consecutive_tx_fetch_failures(&self) -> u32 {
+        self.consecutive_tx_fetch_failures
+    }
+
+    /// Fetches the block header at `height`, retrying transient failures.
     pub async fn get_block_header(&mut self, height: u32) -> Result<HeaderResp> {
         self.version().await?;
 
-        let res = timeout(
-            self.request_timeout,
-            self.client.send_request(request::Header { height }),
-        )
-        .await
-        .map_err(|_| FrigateError::Timeout("Header request timed out".to_owned()))?
-        .map_err(|e| FrigateError::Request(format!("Header request failed: {e}")))?;
-        Ok(res)
+        retry_request!(self, "Header request", request::Header { height })
     }
 
+    /// Fetches a full transaction by txid, retrying transient failures.
+    ///
+    /// A call whose request retries were all exhausted counts as one
+    /// consecutive transaction-fetch failure on this client; a successful
+    /// call resets the count to zero. Callers use the count to detect a
+    /// broken connection (see `FrigateScanner`'s failure semantics).
     pub async fn get_transaction(&mut self, txid: Txid) -> Result<FullTx> {
         self.version().await?;
 
-        let res = timeout(
-            self.request_timeout,
-            self.client.send_request(request::GetTx { txid }),
-        )
-        .await
-        .map_err(|_| FrigateError::Timeout("GetTx request timed out".to_owned()))?
-        .map_err(|e| FrigateError::Request(format!("GetTx request failed: {e}")))?;
-        Ok(res)
+        let result = retry_request!(self, "GetTx request", request::GetTx { txid });
+        match result {
+            Ok(full_tx) => {
+                self.consecutive_tx_fetch_failures = 0;
+                Ok(full_tx)
+            }
+            Err(err) => {
+                self.consecutive_tx_fetch_failures += 1;
+                Err(err)
+            }
+        }
     }
 
     /// Negotiate the Frigate protocol version once and cache the result.
@@ -126,6 +176,9 @@ impl FrigateClient {
     /// sent to the client everytime an ouput is found.
     ///
     /// See: <https://github.com/sparrowwallet/frigate#blockchainsilentpaymentssubscribe>
+    ///
+    /// A failure here is not fatal for the scan: the scanner retries the whole connect +
+    /// subscribe with backoff (see `FrigateScanner`'s failure semantics).
     pub async fn subscribe(&mut self, subscribe_req: request::SpSubscribe) -> Result<String> {
         self.version().await?;
         debug!("Sending subscribe event request...");
@@ -155,36 +208,35 @@ impl FrigateClient {
         Ok(())
     }
 
+    /// Subscribes to `script_hash`, retrying transient failures.
     pub async fn scripthash_subscribe(
         &mut self,
         sub_req: request::ScriptHashSubscribe,
     ) -> Result<Option<ElectrumScriptStatus>> {
         self.version().await?;
-        let res = timeout(self.request_timeout, self.client.send_request(sub_req))
-            .await
-            .map_err(|_| FrigateError::Timeout("Script hash subscription timed out".to_owned()))?
-            .map_err(|e| {
-                FrigateError::Request(format!("Script hash subscription request failed: {e}"))
-            })?;
+        let res = retry_request!(
+            self,
+            "Script hash subscription",
+            request::ScriptHashSubscribe {
+                script_hash: sub_req.script_hash
+            }
+        )?;
 
         info!("Subscribed to script: {res:?}");
         Ok(res)
     }
 
+    /// Fetches the history of `script_hash`, retrying transient failures.
     pub async fn get_history(
         &mut self,
         script_hash: ElectrumScriptHash,
     ) -> Result<Vec<electrum_streaming_client::response::Tx>> {
         self.version().await?;
 
-        let res = timeout(
-            self.request_timeout,
-            self.client
-                .send_request(request::GetHistory { script_hash }),
+        retry_request!(
+            self,
+            "Script history request",
+            request::GetHistory { script_hash }
         )
-        .await
-        .map_err(|_| FrigateError::Timeout("Script history request timed out".to_owned()))?
-        .map_err(|e| FrigateError::Request(format!("Script history request failed: {e}")))?;
-        Ok(res)
     }
 }
