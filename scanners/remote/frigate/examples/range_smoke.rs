@@ -12,12 +12,11 @@ use std::time::Duration;
 use bitcoin::Network;
 use bitcoin::absolute::Height;
 use bitcoin::secp256k1::SecretKey;
+use backend_frigate::FrigateClient;
 use electrum_streaming_client::request::{self, SupportedVersion};
-use electrum_streaming_client::AsyncClient;
 use frigate::Scanner;
 use spdk_core::scanner::Scanner as _;
 use spdk_wallet::client::{SpClient, SpendKey};
-use tokio::net::TcpStream;
 
 const NETWORK: Network = Network::Signet;
 /// Throwaway keys: the server scan finds nothing for them (same shape as `sp_subscribe_smoke`).
@@ -34,12 +33,10 @@ async fn main() -> anyhow::Result<()> {
     let url = std::env::var("FRIGATE_URL").unwrap_or_else(|_| "127.0.0.1:50001".to_owned());
 
     // Tip discovery over a throwaway control connection (mirrors sp_subscribe_smoke).
-    let stream = TcpStream::connect(&url).await?;
-    let (reader, writer) = stream.into_split();
-    let (client, _events, worker) = AsyncClient::new_tokio(reader, writer);
-    let worker = tokio::spawn(worker);
+    let control = FrigateClient::connect(&url).await?;
 
-    let version = client
+    let version = control
+        .client
         .send_request(request::ServerVersion {
             client_name: "spdk-range-smoke".into(),
             protocol_version: SupportedVersion::Range(["1.3.2".into(), "1.4.1".into()]),
@@ -50,10 +47,10 @@ async fn main() -> anyhow::Result<()> {
         version.server_software, version.protocol_version
     );
 
-    let tip = client.send_request(request::HeadersSubscribe).await?;
+    let tip = control.client.send_request(request::HeadersSubscribe).await?;
     let tip_height = tip.height;
     println!("tip -> height={tip_height}");
-    worker.abort();
+    control.worker.abort();
 
     let start_height = tip_height.saturating_sub(RANGE_BACK);
     let end_height = start_height + RANGE_LEN;

@@ -4,6 +4,7 @@ use std::time::Duration;
 use bitcoin::absolute::Height;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid, XOnlyPublicKey};
+use backend_frigate::FrigateClient;
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::response::SpSubscribeResp;
 use electrum_streaming_client::{ElectrumScriptHash, Event, request, response};
@@ -17,7 +18,6 @@ use silentpayments::utils::receiving::{
 use spdk_core::scanner::{DiscoveredOutput, ScanResult, Scanner};
 use tokio::time::sleep;
 
-use crate::client::FrigateClient;
 
 /// Total scan-setup attempts: one initial attempt plus [`SUBSCRIBE_RETRIES`]
 /// retries of the whole connect + subscribe.

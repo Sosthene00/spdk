@@ -7,6 +7,8 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+backend-frigate.workspace = true
+
 electrum_streaming_client.workspace = true
 spdk-core.workspace = true
 silentpayments.workspace = true
@@ -14,8 +16,6 @@ silentpayments.workspace = true
 bitcoin.workspace = true
 futures.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
-tokio-rustls.workspace = true
-webpki-roots.workspace = true
 log.workspace = true
 anyhow.workspace = true
 

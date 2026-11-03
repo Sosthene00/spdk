@@ -15,7 +15,7 @@ use bitcoin::secp256k1::{PublicKey, SecretKey};
 use electrum_streaming_client::Event;
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::request::{self, SupportedVersion};
-use frigate::FrigateClient;
+use backend_frigate::FrigateClient;
 use futures::StreamExt as _;
 
 /// secp256k1 generator point used as a throwaway spend key.

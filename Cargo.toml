@@ -2,6 +2,7 @@
 members = [
   "spdk-core",
   "backends/blindbit-v1",
+  "backends/frigate",
   "spdk-wallet",
   "silentpayments",
   "scanners/local",
@@ -15,6 +16,7 @@ spdk-core = { path = "spdk-core" }
 spdk-wallet = { path = "spdk-wallet" }
 silentpayments = { path = "silentpayments" }
 backend-blindbit-v1 = { path = "backends/blindbit-v1" }
+backend-frigate = { path = "backends/frigate" }
 local-scanner = { path = "scanners/local" }
 
 # Core dependencies - shared across crates
