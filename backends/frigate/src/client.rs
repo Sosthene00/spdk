@@ -19,7 +19,7 @@ pub struct FrigateClient {
     pub events: UnboundedReceiver<Event>,
     pub worker: JoinHandle<Result<(), std::io::Error>>,
     pub request_timeout: Duration,
-    protocol_version: Option<String>,
+    protocol_version: String,
 }
 
 #[derive(Debug)]
@@ -44,30 +44,42 @@ impl std::fmt::Display for FrigateError {
 impl std::error::Error for FrigateError {}
 
 impl FrigateClient {
-    pub async fn connect(host_url: &str) -> Result<Self> {
+    /// Default timeout for the version handshake and later requests.
+    pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Connects and negotiates `server.version` before returning.
+    ///
+    /// `request_timeout` applies to that handshake and to every later request. The handshake is
+    /// the first request on the connection. If it fails, the reader task is aborted.
+    pub async fn connect(host_url: &str, request_timeout: Duration) -> Result<Self> {
         let stream = TcpStream::connect(host_url).await.map_err(|err| {
             FrigateError::Connection(format!("can't connect to socket '{host_url}': {err}"))
         })?;
 
         let (reader, writer) = stream.into_split();
         let (client, events, worker) = AsyncClient::new_tokio(reader, writer);
-
         let worker = tokio::spawn(worker);
+
+        let protocol_version = match negotiate_version(&client, request_timeout).await {
+            Ok(protocol_version) => protocol_version,
+            Err(err) => {
+                worker.abort();
+                return Err(err);
+            }
+        };
 
         Ok(Self {
             client,
             events,
             worker,
-            request_timeout: Duration::from_secs(10),
-            protocol_version: None,
+            request_timeout,
+            protocol_version,
         })
     }
 
-    /// Sets a custom request timeout for this client.
-    #[expect(unused, reason = "tbd")]
-    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
-        self
+    /// Protocol version negotiated with the server during [`Self::connect`].
+    pub fn version(&self) -> &str {
+        &self.protocol_version
     }
 
     /// Returns the network this server is following.
@@ -75,9 +87,7 @@ impl FrigateClient {
     /// Identified from the genesis hash in `server.features`. Only the networks known to
     /// rust-bitcoin are recognized: mainnet, testnet3, testnet4, the default signet, and regtest.
     /// A custom signet genesis hash is rejected.
-    pub async fn network(&mut self) -> Result<Network> {
-        self.version().await?;
-
+    pub async fn network(&self) -> Result<Network> {
         let res = timeout(
             self.request_timeout,
             self.client.send_request(request::Features),
@@ -98,9 +108,7 @@ impl FrigateClient {
     /// this connection to later tip notifications, which arrive on [`Self::events`]. There is no
     /// headers unsubscribe, so those notifications continue until the connection closes. Drain
     /// `events`, or use a connection that is not shared with a scan, if this client stays open.
-    pub async fn block_height(&mut self) -> Result<Height> {
-        self.version().await?;
-
+    pub async fn block_height(&self) -> Result<Height> {
         let res = timeout(
             self.request_timeout,
             self.client.send_request(request::HeadersSubscribe),
@@ -113,9 +121,7 @@ impl FrigateClient {
             .map_err(|e| FrigateError::Request(format!("invalid tip height {}: {e}", res.height)))
     }
 
-    pub async fn get_block_header(&mut self, height: u32) -> Result<HeaderResp> {
-        self.version().await?;
-
+    pub async fn get_block_header(&self, height: u32) -> Result<HeaderResp> {
         let res = timeout(
             self.request_timeout,
             self.client.send_request(request::Header { height }),
@@ -126,9 +132,7 @@ impl FrigateClient {
         Ok(res)
     }
 
-    pub async fn get_transaction(&mut self, txid: Txid) -> Result<FullTx> {
-        self.version().await?;
-
+    pub async fn get_transaction(&self, txid: Txid) -> Result<FullTx> {
         let res = timeout(
             self.request_timeout,
             self.client.send_request(request::GetTx { txid }),
@@ -139,40 +143,12 @@ impl FrigateClient {
         Ok(res)
     }
 
-    /// Negotiate the Frigate protocol version once and cache the result.
-    ///
-    /// The negotiation is sent as the first request on the connection. Later calls return the
-    /// cached version without sending another request.
-    pub async fn version(&mut self) -> Result<String> {
-        if let Some(protocol_version) = &self.protocol_version {
-            return Ok(protocol_version.clone());
-        }
-
-        debug!("Sending version request to Frigate server...");
-        let res = timeout(
-            self.request_timeout,
-            self.client.send_request(request::ServerVersion {
-                client_name: "spdk".into(),
-                protocol_version: request::SupportedVersion::Range([
-                    "1.3.2".into(),
-                    "1.4.1".into(),
-                ]),
-            }),
-        )
-        .await
-        .map_err(|_| FrigateError::Timeout("Version request timed out".to_owned()))?
-        .map_err(|e| FrigateError::Request(format!("Version request failed: {e}")))?;
-        self.protocol_version = Some(res.protocol_version.clone());
-        Ok(res.protocol_version)
-    }
-
     /// Make a request to the Frigate electrum server to subscribe to the outputs beloging to the
     /// given silent payment address Once the server receives the request notification will be
     /// sent to the client everytime an ouput is found.
     ///
     /// See: <https://github.com/sparrowwallet/frigate#blockchainsilentpaymentssubscribe>
-    pub async fn subscribe(&mut self, subscribe_req: request::SpSubscribe) -> Result<String> {
-        self.version().await?;
+    pub async fn subscribe(&self, subscribe_req: request::SpSubscribe) -> Result<String> {
         debug!("Sending subscribe event request...");
 
         let res = timeout(
@@ -188,9 +164,7 @@ impl FrigateClient {
     }
 
     #[expect(unused, reason = "tbd")]
-    pub async fn unsubscribe(&mut self, unsub_req: request::SpUnsubscribe) -> Result<()> {
-        self.version().await?;
-
+    pub async fn unsubscribe(&self, unsub_req: request::SpUnsubscribe) -> Result<()> {
         let res = timeout(self.request_timeout, self.client.send_request(unsub_req))
             .await
             .map_err(|_| FrigateError::Timeout("Unsubscribe request timed out".to_owned()))?
@@ -201,10 +175,9 @@ impl FrigateClient {
     }
 
     pub async fn scripthash_subscribe(
-        &mut self,
+        &self,
         sub_req: request::ScriptHashSubscribe,
     ) -> Result<Option<ElectrumScriptStatus>> {
-        self.version().await?;
         let res = timeout(self.request_timeout, self.client.send_request(sub_req))
             .await
             .map_err(|_| FrigateError::Timeout("Script hash subscription timed out".to_owned()))?
@@ -217,11 +190,9 @@ impl FrigateClient {
     }
 
     pub async fn get_history(
-        &mut self,
+        &self,
         script_hash: ElectrumScriptHash,
     ) -> Result<Vec<electrum_streaming_client::response::Tx>> {
-        self.version().await?;
-
         let res = timeout(
             self.request_timeout,
             self.client
@@ -232,4 +203,19 @@ impl FrigateClient {
         .map_err(|e| FrigateError::Request(format!("Script history request failed: {e}")))?;
         Ok(res)
     }
+}
+
+async fn negotiate_version(client: &AsyncClient, request_timeout: Duration) -> Result<String> {
+    debug!("Sending version request to Frigate server...");
+    let res = timeout(
+        request_timeout,
+        client.send_request(request::ServerVersion {
+            client_name: "spdk".into(),
+            protocol_version: request::SupportedVersion::Range(["1.3.2".into(), "1.4.1".into()]),
+        }),
+    )
+    .await
+    .map_err(|_| FrigateError::Timeout("Version request timed out".to_owned()))?
+    .map_err(|e| FrigateError::Request(format!("Version request failed: {e}")))?;
+    Ok(res.protocol_version)
 }
