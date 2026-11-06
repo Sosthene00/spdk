@@ -146,7 +146,12 @@ impl FrigateClient {
     /// TLS connect for the host part of an `ssl://host:port` URL (the prefix
     /// is already stripped). Plain TCP is wrapped with rustls; the negotiated
     /// TLS stream is split into read/write halves for the streaming client.
-    async fn connect_tls(host: &str) -> Result<(Box<dyn AsyncRead + Send + Unpin>, Box<dyn AsyncWrite + Send + Unpin>)> {
+    async fn connect_tls(
+        host: &str,
+    ) -> Result<(
+        Box<dyn AsyncRead + Send + Unpin>,
+        Box<dyn AsyncWrite + Send + Unpin>,
+    )> {
         let (server_name, port) = host.rsplit_once(':').ok_or_else(|| {
             FrigateError::Connection(format!("ssl:// URL '{host}' must be 'ssl://host:port'"))
         })?;
@@ -160,8 +165,10 @@ impl FrigateClient {
                 FrigateError::Connection(format!("can't connect to socket '{host}': {err}"))
             })?;
 
-        let roots =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let roots = webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .cloned()
+            .collect::<rustls::RootCertStore>();
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();

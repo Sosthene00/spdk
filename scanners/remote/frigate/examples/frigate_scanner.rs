@@ -27,14 +27,8 @@ async fn main() -> anyhow::Result<()> {
     // The scan private key is sent to the server on every subscribe — only
     // point FRIGATE_URL at servers you trust (see the crate README).
     let frigate_url = std::env::var("FRIGATE_URL").unwrap_or_else(|_| "127.0.0.1:50001".to_owned());
-    let frigate_scanner = FrigateScanner::new(
-        frigate_url,
-        scan_sk,
-        sp_receiver,
-        None,
-        HashMap::new(),
-    )
-    .await?;
+    let frigate_scanner =
+        FrigateScanner::new(frigate_url, scan_sk, sp_receiver, None, HashMap::new()).await?;
 
     println!("Receiving code for this key pair + network:");
     println!("{}", sp_client.receiving_code());
