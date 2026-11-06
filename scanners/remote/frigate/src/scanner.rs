@@ -21,6 +21,10 @@ use spdk_core::scanner::{DiscoveredOutput, ScanResult};
 use tokio::task::JoinHandle;
 
 const EVENT_BUFFER: usize = 100_000;
+/// Consecutive transaction-fetch failures (counted after each call's request
+/// retries were exhausted) tolerated before the connection is treated as
+/// broken and the worker stops.
+const MAX_CONSECUTIVE_TX_FETCH_FAILURES: u32 = 10;
 
 /// Events from a [`FrigateScanner`] worker.
 ///
@@ -87,7 +91,11 @@ pub struct FrigateScanner {
     b_scan: SecretKey,
     sp_receiver: SpReceiver,
     labels: Option<Vec<u32>>,
-    owned_outpoints: HashSet<OutPoint>,
+    /// Outputs of earlier runs of this wallet (script → outpoints). Re-subscribed on `start`,
+    /// so spend monitoring survives a restart: the Frigate protocol re-delivers silent payment
+    /// history only from the requested start height, so without this, outputs confirmed before
+    /// the checkpoint would never be watched for spends again.
+    previous_outputs: HashMap<ScriptBuf, HashSet<OutPoint>>,
     tip_height: Height,
     tip_hash: BlockHash,
 }
@@ -98,7 +106,7 @@ impl FrigateScanner {
         b_scan: SecretKey,
         sp_receiver: SpReceiver,
         labels: Option<Vec<u32>>,
-        owned_outpoints: HashSet<OutPoint>,
+        previous_outputs: HashMap<ScriptBuf, HashSet<OutPoint>>,
     ) -> anyhow::Result<Self> {
         let client = FrigateClient::connect(&host_url, None).await?;
         let (tip_height, tip_hash) = client.block_height().await?;
@@ -107,7 +115,7 @@ impl FrigateScanner {
             b_scan,
             sp_receiver,
             labels,
-            owned_outpoints,
+            previous_outputs,
             tip_height,
             tip_hash,
         })
@@ -118,6 +126,17 @@ impl FrigateScanner {
     /// The first events are the current tip and historical matches. [`FrigateEvent::CaughtUp`]
     /// marks the end of history. The worker then keeps forwarding live block, mempool, tip, and
     /// spend events.
+    ///
+    /// The outputs of earlier runs (passed to [`FrigateScanner::new`]) are re-subscribed right
+    /// after the silent payment subscribe, and their history is swept once: the Frigate protocol
+    /// reports a script's pre-existing history only in the subscribe response and does not
+    /// re-notify it, so this is the only chance to detect spends that happened while the wallet
+    /// was offline. They surface as [`FrigateEvent::Spent`].
+    ///
+    /// On [`FrigateEvent::Disconnected`] the consumer may rebuild a scanner (passing its
+    /// persisted outputs as `previous_outputs`) and `start` again from its checkpoint height:
+    /// history from there is re-delivered, and consumers should treat confirmed outpoints as
+    /// idempotent.
     pub fn start(self, from: Height) -> FrigateHandle {
         info!("Frigate scan from {}", from.to_consensus_u32());
         let (mut tx, events) = channel(EVENT_BUFFER);
@@ -160,6 +179,24 @@ impl FrigateScanner {
             unconfirmed: HashMap::new(),
             caught_up: false,
         };
+
+        for (script, outpoints) in std::mem::take(&mut self.previous_outputs) {
+            let script_hash = ElectrumScriptHash::from(script.as_script());
+            watch
+                .tracked_scripts
+                .entry(script_hash)
+                .or_default()
+                .extend(outpoints);
+            let request = request::ScriptHashSubscribe { script_hash };
+            match self.client.scripthash_subscribe(request).await {
+                Ok(_) => sweep_script(&self.client, script_hash, &mut watch, tx).await?,
+                // The script stays tracked: if a spend arrives later, the
+                // script-hash notification re-runs the sweep.
+                Err(err) => {
+                    error!("Unable to resubscribe previous output script {script_hash}: {err}");
+                }
+            }
+        }
 
         while let Some(event) = self.client.events.next().await {
             let Event::Notification(notification) = event else {
@@ -204,18 +241,19 @@ impl FrigateScanner {
 
         for (height, tweaks) in confirmed_by_height {
             let header =
-                self.client.get_block_header(height).await.map_err(|err| {
-                    Stop::Disconnect(format!("block header {height} failed: {err}"))
-                })?;
+                self.client
+                    .get_block_header(height)
+                    .await
+                    .map_err(|err| Stop::Disconnect(format!("block header {height} failed: {err}")))?;
             let blkheight = Height::from_consensus(height)
                 .map_err(|err| Stop::Disconnect(format!("invalid block height {height}: {err}")))?;
             let blkhash = header.header.block_hash();
             for (txid, tweak) in tweaks {
-                let Some(discovered_outputs) = self.discover(txid, &tweak).await else {
+                let Some(discovered_outputs) = self.discover(txid, &tweak).await? else {
                     continue;
                 };
                 watch.unconfirmed.remove(&txid);
-                self.note_outputs(watch, &discovered_outputs).await;
+                subscribe_outputs(&self.client, watch, &discovered_outputs, tx).await?;
                 if !send(
                     tx,
                     FrigateEvent::Confirmed(ScanResult {
@@ -233,10 +271,10 @@ impl FrigateScanner {
         }
 
         for (txid, tweak) in mempool {
-            let Some(discovered_outputs) = self.discover(txid, &tweak).await else {
+            let Some(discovered_outputs) = self.discover(txid, &tweak).await? else {
                 continue;
             };
-            self.note_outputs(watch, &discovered_outputs).await;
+            subscribe_outputs(&self.client, watch, &discovered_outputs, tx).await?;
             watch.unconfirmed.insert(txid, discovered_outputs.clone());
             if !send(
                 tx,
@@ -268,30 +306,11 @@ impl FrigateScanner {
         watch: &mut Watch,
     ) -> Result<(), Stop> {
         let script_hash = notification.script_hash();
-        let events = match script_events(&self.client, script_hash, watch).await {
-            Ok(events) => events,
-            Err(err) => {
-                error!("Unable to inspect history for script hash {script_hash}: {err}");
-                return Ok(());
-            }
-        };
-
-        for event in events {
-            if let FrigateEvent::Spent(ref spent) = event {
-                self.owned_outpoints
-                    .retain(|outpoint| !spent.contains(outpoint));
-                for outpoints in watch.tracked_scripts.values_mut() {
-                    outpoints.retain(|outpoint| !spent.contains(outpoint));
-                }
-                watch
-                    .tracked_scripts
-                    .retain(|_, outpoints| !outpoints.is_empty());
-            }
-            if !send(tx, event).await {
-                return Err(Stop::CallerGone);
-            }
+        if !watch.tracked_scripts.contains_key(&script_hash) {
+            debug!("Ignoring script-hash notification for untracked script {script_hash}");
+            return Ok(());
         }
-        Ok(())
+        sweep_script(&self.client, script_hash, watch, tx).await
     }
 
     async fn on_header(
@@ -336,39 +355,42 @@ impl FrigateScanner {
         Ok(())
     }
 
+    /// Fetches `txid` and returns its owned outputs, or `None` when the
+    /// transaction holds none of ours or could not be processed.
+    ///
+    /// A transaction fetch that exhausts the client's retries is skipped (with
+    /// a warning) unless the consecutive-failure budget is exceeded, in which
+    /// case the connection is treated as broken and the worker stops with
+    /// `Stop::Disconnect` (surfaced as [`FrigateEvent::Disconnected`]).
     async fn discover(
         &self,
         txid: Txid,
         tweak: &PublicKey,
-    ) -> Option<HashMap<OutPoint, DiscoveredOutput>> {
+    ) -> Result<Option<HashMap<OutPoint, DiscoveredOutput>>, Stop> {
         let full_tx = match self.client.get_transaction(txid).await {
             Ok(full_tx) => full_tx,
             Err(err) => {
+                let failures = self.client.consecutive_tx_fetch_failures();
+                if failures > MAX_CONSECUTIVE_TX_FETCH_FAILURES {
+                    return Err(Stop::Disconnect(format!(
+                        "{failures} consecutive transaction-fetch failures (limit {MAX_CONSECUTIVE_TX_FETCH_FAILURES}); connection treated as broken"
+                    )));
+                }
                 warn!("Skipping transaction {txid} after fetch failure: {err}");
-                return None;
+                return Ok(None);
             }
         };
         match process_outputs(&full_tx.tx, &self.b_scan, &self.sp_receiver, tweak) {
             Ok(outputs) if outputs.is_empty() => {
                 debug!("No owned outputs in {txid}");
-                None
+                Ok(None)
             }
-            Ok(outputs) => Some(outputs),
+            Ok(outputs) => Ok(Some(outputs)),
             Err(err) => {
                 warn!("Skipping malformed transaction {txid}: {err}");
-                None
+                Ok(None)
             }
         }
-    }
-
-    async fn note_outputs(
-        &mut self,
-        watch: &mut Watch,
-        discovered_outputs: &HashMap<OutPoint, DiscoveredOutput>,
-    ) {
-        self.owned_outpoints
-            .extend(discovered_outputs.keys().copied());
-        subscribe_outputs(&self.client, &mut watch.tracked_scripts, discovered_outputs).await;
     }
 }
 
@@ -376,16 +398,121 @@ async fn send(tx: &mut Sender<FrigateEvent>, event: FrigateEvent) -> bool {
     tx.send(event).await.is_ok()
 }
 
+/// Subscribes to the script hash of every discovered output and tracks its outpoints.
+///
+/// For a script tracked for the first time, the subscription is immediately followed by a
+/// history sweep: the Frigate protocol reports a script's pre-existing history only in the
+/// subscribe response and does not re-notify it, so spends that pre-date the subscription
+/// (an output spent inside the block we just learned about, or while the wallet was offline)
+/// are detected here and emitted as [`FrigateEvent::Spent`].
+///
+/// Subscribe failures are logged and skipped (the script stays tracked; a later script-hash
+/// notification re-runs the sweep). Only a failure to forward an event on the channel is fatal.
+async fn subscribe_outputs(
+    client: &FrigateClient,
+    watch: &mut Watch,
+    discovered_outputs: &HashMap<OutPoint, DiscoveredOutput>,
+    tx: &mut Sender<FrigateEvent>,
+) -> Result<(), Stop> {
+    for (outpoint, output) in discovered_outputs {
+        let script_hash = ElectrumScriptHash::from(output.txout.script_pubkey.as_script());
+        let first_output_for_script = !watch.tracked_scripts.contains_key(&script_hash);
+        watch
+            .tracked_scripts
+            .entry(script_hash)
+            .or_default()
+            .insert(*outpoint);
+
+        if !first_output_for_script {
+            continue;
+        }
+
+        let request = request::ScriptHashSubscribe { script_hash };
+        if let Err(err) = client.scripthash_subscribe(request).await {
+            error!("Unable to subscribe to script hash {script_hash}: {err}");
+            continue;
+        }
+
+        sweep_script(client, script_hash, watch, tx).await?;
+    }
+    Ok(())
+}
+
+/// Fetches `script_hash`'s history once and forwards the events it yields.
+///
+/// Held mempool discoveries that now show a confirmation height become
+/// [`FrigateEvent::Confirmed`]; unseen confirmed transactions spending tracked outpoints
+/// become [`FrigateEvent::Spent`]. History and transaction fetch failures are logged and
+/// skipped WITHOUT being marked inspected, so a later notification for the script retries
+/// them; each transaction-fetch failure counts toward the client's consecutive-failure
+/// budget. Only a failure to forward an event on the channel is fatal (the consumer is gone).
+async fn sweep_script(
+    client: &FrigateClient,
+    script_hash: ElectrumScriptHash,
+    watch: &mut Watch,
+    tx: &mut Sender<FrigateEvent>,
+) -> Result<(), Stop> {
+    let events = script_events(client, script_hash, watch).await?;
+    emit_script_events(script_hash, events, watch, tx).await
+}
+
+/// Applies the event bookkeeping (dropping spent outpoints from tracking, together with the
+/// script's inspection cache once it has no tracked outpoints left) and forwards the events.
+async fn emit_script_events(
+    script_hash: ElectrumScriptHash,
+    events: Vec<FrigateEvent>,
+    watch: &mut Watch,
+    tx: &mut Sender<FrigateEvent>,
+) -> Result<(), Stop> {
+    for event in events {
+        if let FrigateEvent::Spent(ref spent) = event {
+            for outpoints in watch.tracked_scripts.values_mut() {
+                outpoints.retain(|outpoint| !spent.contains(outpoint));
+            }
+            watch
+                .tracked_scripts
+                .retain(|_, outpoints| !outpoints.is_empty());
+            // The script left tracking: its inspection cache can no longer grow.
+            watch.inspected_txids.remove(&script_hash);
+        }
+        if !send(tx, event).await {
+            return Err(Stop::CallerGone);
+        }
+    }
+    Ok(())
+}
+
+/// Turns one fetch of `script_hash`'s history into events.
+///
+/// A held mempool discovery is confirmed once its txid shows a confirmation height in the
+/// script's history (the canonical confirmation channel — the Frigate protocol does not
+/// re-notify a mempool transaction when it confirms). Every confirmed history transaction not
+/// inspected yet is fetched and its inputs are checked against the script's tracked outpoints;
+/// inspected txids are remembered so each transaction is inspected once.
+///
+/// Errors: a `get_history` failure is logged and yields no events (the next notification for
+/// the script re-runs the sweep); a transaction fetch that exhausts the client's retries is
+/// skipped uninspected unless the consecutive-failure budget is exceeded, in which case the
+/// connection is treated as broken and `Stop::Disconnect` propagates (the worker stops and
+/// surfaces [`FrigateEvent::Disconnected`]; the txid stays uninspected so a restart re-checks it).
 async fn script_events(
     client: &FrigateClient,
     script_hash: ElectrumScriptHash,
     watch: &mut Watch,
-) -> anyhow::Result<Vec<FrigateEvent>> {
+) -> Result<Vec<FrigateEvent>, Stop> {
     let Some(owned_outpoints) = watch.tracked_scripts.get(&script_hash).cloned() else {
         return Ok(Vec::new());
     };
 
-    let history = client.get_history(script_hash).await?;
+    let history = match client.get_history(script_hash).await {
+        Ok(history) => history,
+        Err(err) => {
+            // Transient: the next notification for this script re-runs the sweep.
+            error!("Unable to inspect history for script hash {script_hash}: {err}");
+            return Ok(Vec::new());
+        }
+    };
+
     let mut events = Vec::new();
     let mut spent = HashSet::new();
     let mut newly_inspected = HashSet::new();
@@ -422,6 +549,12 @@ async fn script_events(
         let full_tx = match client.get_transaction(txid).await {
             Ok(full_tx) => full_tx,
             Err(err) => {
+                let failures = client.consecutive_tx_fetch_failures();
+                if failures > MAX_CONSECUTIVE_TX_FETCH_FAILURES {
+                    return Err(Stop::Disconnect(format!(
+                        "{failures} consecutive transaction-fetch failures (limit {MAX_CONSECUTIVE_TX_FETCH_FAILURES}); connection treated as broken"
+                    )));
+                }
                 error!("Unable to fetch transaction {txid}: {err}");
                 continue;
             }
@@ -446,30 +579,6 @@ async fn script_events(
         events.push(FrigateEvent::Spent(spent));
     }
     Ok(events)
-}
-
-async fn subscribe_outputs(
-    client: &FrigateClient,
-    tracked_scripts: &mut HashMap<ElectrumScriptHash, HashSet<OutPoint>>,
-    discovered_outputs: &HashMap<OutPoint, DiscoveredOutput>,
-) {
-    for (outpoint, output) in discovered_outputs {
-        let script_hash = ElectrumScriptHash::from(output.txout.script_pubkey.as_script());
-        let first_output_for_script = !tracked_scripts.contains_key(&script_hash);
-        tracked_scripts
-            .entry(script_hash)
-            .or_default()
-            .insert(*outpoint);
-
-        if !first_output_for_script {
-            continue;
-        }
-
-        let request = request::ScriptHashSubscribe { script_hash };
-        if let Err(err) = client.scripthash_subscribe(request).await {
-            error!("Unable to subscribe to script hash {script_hash}: {err}");
-        }
-    }
 }
 
 pub fn process_outputs(
