@@ -241,10 +241,9 @@ impl FrigateScanner {
 
         for (height, tweaks) in confirmed_by_height {
             let header =
-                self.client
-                    .get_block_header(height)
-                    .await
-                    .map_err(|err| Stop::Disconnect(format!("block header {height} failed: {err}")))?;
+                self.client.get_block_header(height).await.map_err(|err| {
+                    Stop::Disconnect(format!("block header {height} failed: {err}"))
+                })?;
             let blkheight = Height::from_consensus(height)
                 .map_err(|err| Stop::Disconnect(format!("invalid block height {height}: {err}")))?;
             let blkhash = header.header.block_hash();

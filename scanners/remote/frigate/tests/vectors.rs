@@ -29,21 +29,18 @@
 use bitcoin::absolute::LockTime;
 use bitcoin::blockdata::transaction::Version;
 use bitcoin::consensus::serialize as consensus_serialize;
-use bitcoin::hashes::{sha256, Hash as _};
-use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey, Secp256k1};
+use bitcoin::hashes::{Hash as _, sha256};
+use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin::witness::Witness;
 use bitcoin::{Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
-use spdk_wallet::client::{SpClient, SpendKey};
-
 use frigate::process_outputs;
+use spdk_wallet::client::{SpClient, SpendKey};
 
 /// BIP-352 `send_and_receive_test_vectors.json`, entry 6 (receiving side):
 /// `given.key_material.scan_priv_key`.
-const SCAN_PRIV_KEY_HEX: &str =
-    "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+const SCAN_PRIV_KEY_HEX: &str = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
 /// `given.key_material.spend_priv_key`.
-const SPEND_PRIV_KEY_HEX: &str =
-    "9d6ad855ce3417ef84e836892e5a56392bfba05fa5d97ccea30e266f540e08b3";
+const SPEND_PRIV_KEY_HEX: &str = "9d6ad855ce3417ef84e836892e5a56392bfba05fa5d97ccea30e266f540e08b3";
 /// `expected.input_pub_key_sum`: A = sum of the eligible (all-P2TR) input keys.
 const INPUT_PUB_KEY_SUM_HEX: &str =
     "038180a2125f9d6dd116e1a6139be4d72fd5057dab6aaabaa5654817c11baeb3ba";
@@ -58,8 +55,7 @@ const GIVEN_OUTPUT_XONLY_HEX: &str =
 const EXPECTED_OUTPUT_PUB_HEX: &str =
     "de88bea8e7ffc9ce1af30d1132f910323c505185aec8eae361670421e749a1fb";
 /// `expected.outputs[0].priv_key_tweak`: `t_0 = hash(shared_secret || 0)`.
-const PRIV_KEY_TWEAK_HEX: &str =
-    "3fb9ce5ce1746ced103c8ed254e81f6690764637ddbc876ec1f9b3ddab776b03";
+const PRIV_KEY_TWEAK_HEX: &str = "3fb9ce5ce1746ced103c8ed254e81f6690764637ddbc876ec1f9b3ddab776b03";
 
 /// `given.vin` txids (display order); both prevout scriptPubKeys are P2TR
 /// (`5120...`), so every input is silent-payment eligible and `A_sum` covers all
@@ -79,8 +75,7 @@ fn hex_decode(hex: &str) -> Vec<u8> {
 /// BIP-352 input hash over the lexicographically smallest serialized outpoint
 /// and the sum of eligible input pubkeys.
 fn input_hash_scalar(outpoints: &[OutPoint], a_sum: &PublicKey) -> Scalar {
-    let mut serialized: Vec<Vec<u8>> =
-        outpoints.iter().map(consensus_serialize).collect();
+    let mut serialized: Vec<Vec<u8>> = outpoints.iter().map(consensus_serialize).collect();
     serialized.sort();
     let outpoint_l = &serialized[0];
 
@@ -138,8 +133,7 @@ fn bip352_receive_vector_scans_expected_output() {
     let secp = Secp256k1::new();
 
     let scan_sk = SecretKey::from_slice(&hex_decode(SCAN_PRIV_KEY_HEX)).expect("valid scan key");
-    let spend_sk =
-        SecretKey::from_slice(&hex_decode(SPEND_PRIV_KEY_HEX)).expect("valid spend key");
+    let spend_sk = SecretKey::from_slice(&hex_decode(SPEND_PRIV_KEY_HEX)).expect("valid spend key");
     let expected_tweak =
         PublicKey::from_slice(&hex_decode(EXPECTED_TWEAK_HEX)).expect("valid tweak constant");
     let priv_key_tweak = Scalar::from_be_bytes(
@@ -204,8 +198,7 @@ fn bip352_receive_vector_scans_expected_output() {
 fn bip352_receive_vector_with_different_b_scan_finds_nothing() {
     let secp = Secp256k1::new();
 
-    let spend_sk =
-        SecretKey::from_slice(&hex_decode(SPEND_PRIV_KEY_HEX)).expect("valid spend key");
+    let spend_sk = SecretKey::from_slice(&hex_decode(SPEND_PRIV_KEY_HEX)).expect("valid spend key");
     // A different b_scan than the vector's (any valid, distinct scalar).
     let other_b_scan = SecretKey::from_slice(&[0x42u8; 32]).expect("valid scalar");
 
@@ -219,8 +212,8 @@ fn bip352_receive_vector_with_different_b_scan_finds_nothing() {
         .expect("valid wallet");
     let sp_receiver = sp_client.receiver();
 
-    let discovered = process_outputs(&tx, &other_b_scan, &sp_receiver, &tweak)
-        .expect("scanning succeeds");
+    let discovered =
+        process_outputs(&tx, &other_b_scan, &sp_receiver, &tweak).expect("scanning succeeds");
     assert!(
         discovered.is_empty(),
         "a different b_scan must not discover any output"
