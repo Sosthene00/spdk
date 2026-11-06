@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use bitcoin::absolute::Height;
 use bitcoin::constants::ChainHash;
-use bitcoin::{Block, BlockHash, Network, Txid};
-use electrum_streaming_client::notification::HeaderNotification;
+use bitcoin::{BlockHash, Network, Txid};
 use electrum_streaming_client::response::{FullTx, HeaderResp, HeadersSubscribeResp};
 use electrum_streaming_client::{
     AsyncClient, ElectrumScriptHash, ElectrumScriptStatus, Event, request,
@@ -106,13 +105,13 @@ impl FrigateClient {
         })
     }
 
-    /// Returns the height and block hash of the chain tip, and subscribe to .
+    /// Returns the height, hash and header of the chain tip.
     ///
     /// Electrum exposes the tip through `blockchain.headers.subscribe`. That call also subscribes
     /// this connection to later tip notifications, which arrive on [`Self::events`]. There is no
     /// headers unsubscribe, so those notifications continue until the connection closes. Drain
     /// `events`, or use a connection that is not shared with a scan, if this client stays open.
-    pub async fn subscribe_header(&self) -> Result<HeaderNotification> {
+    pub async fn subscribe_header(&self) -> Result<HeadersSubscribeResp> {
         let res = timeout(
             self.request_timeout,
             self.client.send_request(request::HeadersSubscribe),
@@ -122,6 +121,16 @@ impl FrigateClient {
         .map_err(|e| FrigateError::Request(format!("Headers subscribe request failed: {e}")))?;
 
         Ok(res)
+    }
+
+    /// Returns the `(height, block hash)` of the chain tip, subscribing to tip
+    /// notifications as a side effect (see [`Self::subscribe_header`]).
+    pub async fn block_height(&self) -> Result<(Height, BlockHash)> {
+        let tip = self.subscribe_header().await?;
+        let height = Height::from_consensus(tip.height).map_err(|err| {
+            FrigateError::Request(format!("invalid tip height {}: {err}", tip.height))
+        })?;
+        Ok((height, tip.header.block_hash()))
     }
 
     pub async fn get_block_header(&self, height: u32) -> Result<HeaderResp> {
