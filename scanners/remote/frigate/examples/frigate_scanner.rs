@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use bitcoin::Network;
 use bitcoin::absolute::Height;
@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
         scan_sk,
         sp_receiver,
         None,
-        HashSet::new(),
+        HashMap::new(),
     )
     .await?;
 
