@@ -1,2 +1,3 @@
 mod scanner;
-pub use scanner::FrigateScanner as Scanner;
+
+pub use scanner::{FrigateEvent, FrigateHandle, FrigateScanner, process_outputs};

@@ -1,20 +1,86 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
+use backend_frigate::FrigateClient;
 use bitcoin::absolute::Height;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-use bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid, XOnlyPublicKey};
-use backend_frigate::FrigateClient;
-use electrum_streaming_client::notification::Notification;
+use bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid, XOnlyPublicKey};
+use electrum_streaming_client::notification::{
+    HeaderNotification, Notification, ScriptHashNotification, SpNotification,
+};
 use electrum_streaming_client::{ElectrumScriptHash, Event, request};
-use futures::channel::mpsc::{Receiver, channel};
-use futures::{SinkExt as _, StreamExt as _};
+use futures::channel::mpsc::{Receiver, Sender, channel};
+use futures::{SinkExt as _, Stream, StreamExt as _};
 use log::{debug, error, info, warn};
 use silentpayments::receiving::Receiver as SpReceiver;
 use silentpayments::utils::receiving::{
     calculate_ecdh_shared_secret, generate_script_pubkey_from_output_key,
 };
-use spdk_core::scanner::{DiscoveredOutput, ScanResult, Scanner};
+use spdk_core::scanner::{DiscoveredOutput, ScanResult};
+use tokio::task::JoinHandle;
 
+const EVENT_BUFFER: usize = 100_000;
+
+/// Events from a [`FrigateScanner`] worker.
+///
+/// Historical results arrive before the first [`FrigateEvent::CaughtUp`]. Later events are the
+/// current phase: new blocks, mempool transactions, tip changes, and spends. The worker does not
+/// retract a confirmed output whose block is later reorged.
+#[derive(Debug)]
+pub enum FrigateEvent {
+    /// Owned outputs confirmed in a block.
+    Confirmed(ScanResult),
+    /// Owned outputs seen in the mempool. A later [`FrigateEvent::Confirmed`] reports confirmation.
+    Unconfirmed {
+        txid: Txid,
+        discovered_outputs: HashMap<OutPoint, DiscoveredOutput>,
+    },
+    /// The historical scan has reached progress `1.0`. Emitted once.
+    CaughtUp,
+    /// The chain tip. A same-height notice with a different hash is a reorg of the tip block.
+    Tip { height: Height, hash: BlockHash },
+    /// Outpoints spent in a confirmed transaction.
+    Spent(HashSet<OutPoint>),
+    /// The connection ended. No further events follow.
+    Disconnected(String),
+}
+
+/// Handle for a running Frigate worker.
+///
+/// Dropping the handle aborts the worker. The stream ends after [`FrigateEvent::Disconnected`]
+/// or when the worker stops.
+#[must_use = "dropping the handle aborts the frigate worker"]
+pub struct FrigateHandle {
+    events: Receiver<FrigateEvent>,
+    worker: JoinHandle<()>,
+}
+
+impl Drop for FrigateHandle {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
+
+impl Stream for FrigateHandle {
+    type Item = FrigateEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.events.poll_next_unpin(cx)
+    }
+}
+
+enum Stop {
+    CallerGone,
+    Disconnect(String),
+}
+
+struct Watch {
+    tracked_scripts: HashMap<ElectrumScriptHash, HashSet<OutPoint>>,
+    inspected_txids: HashMap<ElectrumScriptHash, HashSet<Txid>>,
+    unconfirmed: HashMap<Txid, HashMap<OutPoint, DiscoveredOutput>>,
+    caught_up: bool,
+}
 
 pub struct FrigateScanner {
     client: FrigateClient,
@@ -22,6 +88,8 @@ pub struct FrigateScanner {
     sp_receiver: SpReceiver,
     labels: Option<Vec<u32>>,
     owned_outpoints: HashSet<OutPoint>,
+    tip_height: Height,
+    tip_hash: BlockHash,
 }
 
 impl FrigateScanner {
@@ -33,237 +101,355 @@ impl FrigateScanner {
         owned_outpoints: HashSet<OutPoint>,
     ) -> anyhow::Result<Self> {
         let client = FrigateClient::connect(&host_url, None).await?;
+        let (tip_height, tip_hash) = client.block_height().await?;
         Ok(Self {
             client,
             b_scan,
             sp_receiver,
             labels,
             owned_outpoints,
+            tip_height,
+            tip_hash,
         })
     }
 
-    /// Starts a scan and keeps listening for confirmed spends of discovered outputs.
+    /// Subscribe from `from` and run until this handle is dropped or the connection ends.
     ///
-    /// The scan receiver is closed when the historical scan reaches progress `1.0`. The spent
-    /// receiver remains open for subsequent script-hash notifications.
-    pub fn scan_blocks_with_spent_outputs(
-        self,
-        range: std::ops::RangeInclusive<Height>,
-    ) -> (Receiver<ScanResult>, Receiver<HashSet<OutPoint>>) {
-        self.start_scan(range, true)
+    /// The first events are the current tip and historical matches. [`FrigateEvent::CaughtUp`]
+    /// marks the end of history. The worker then keeps forwarding live block, mempool, tip, and
+    /// spend events.
+    pub fn start(self, from: Height) -> FrigateHandle {
+        info!("Frigate scan from {}", from.to_consensus_u32());
+        let (mut tx, events) = channel(EVENT_BUFFER);
+        let worker = tokio::spawn(async move {
+            if let Err(Stop::Disconnect(message)) = self.run(from, &mut tx).await {
+                let _ = tx.send(FrigateEvent::Disconnected(message)).await;
+            }
+        });
+        FrigateHandle { events, worker }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "scan orchestration will be refactored later"
-    )]
-    fn start_scan(
-        mut self,
-        range: std::ops::RangeInclusive<Height>,
-        monitor_spent: bool,
-    ) -> (Receiver<ScanResult>, Receiver<HashSet<OutPoint>>) {
+    async fn run(mut self, from: Height, tx: &mut Sender<FrigateEvent>) -> Result<(), Stop> {
+        if !send(
+            tx,
+            FrigateEvent::Tip {
+                height: self.tip_height,
+                hash: self.tip_hash,
+            },
+        )
+        .await
+        {
+            return Err(Stop::CallerGone);
+        }
+
         let subscribe_params = request::SpSubscribe {
             scan_priv_key: self.b_scan,
             spend_pub_key: self.sp_receiver.receiving_code().m_pubkey(),
-            start_height: Some(range.start().to_consensus_u32()),
-            labels: self.labels,
+            start_height: Some(from.to_consensus_u32()),
+            labels: self.labels.take(),
+        };
+        if let Err(err) = self.client.subscribe(subscribe_params).await {
+            return Err(Stop::Disconnect(format!(
+                "silent payment subscribe failed: {err}"
+            )));
+        }
+
+        let mut watch = Watch {
+            tracked_scripts: HashMap::new(),
+            inspected_txids: HashMap::new(),
+            unconfirmed: HashMap::new(),
+            caught_up: false,
         };
 
-        info!(
-            "start: {} end: {}",
-            range.start().to_consensus_u32(),
-            range.end().to_consensus_u32(),
-        );
-
-        let (scan_tx, scan_rx) = channel(100_000);
-        let (mut spent_tx, spent_rx) = channel(100_000);
-
-        tokio::spawn(async move {
-            let mut scan_tx = Some(scan_tx);
-            let mut tracked_scripts: HashMap<ElectrumScriptHash, HashSet<OutPoint>> =
-                HashMap::new();
-            let mut inspected_txids: HashMap<ElectrumScriptHash, HashSet<Txid>> = HashMap::new();
-
-            match self.client.subscribe(subscribe_params).await {
-                Ok(sp_address) => info!("Subscribed to silent payments address {sp_address}"),
-                Err(e) => {
-                    error!("Unable to subscribe to silent payments: {e}");
-                    return;
+        while let Some(event) = self.client.events.next().await {
+            let Event::Notification(notification) = event else {
+                continue;
+            };
+            match notification {
+                Notification::SpSubscribe(notification) => {
+                    self.on_silent_payments(notification, tx, &mut watch)
+                        .await?;
+                }
+                Notification::ScriptHash(notification) => {
+                    self.on_script_hash(notification, tx, &mut watch).await?;
+                }
+                Notification::Header(header) => self.on_header(header, tx).await?,
+                Notification::Unknown(notification) => {
+                    debug!("Ignoring unsupported notification: {notification:?}");
                 }
             }
+        }
 
-            while let Some(event) = self.client.events.next().await {
-                let Event::Notification(notification) = event else {
+        Err(Stop::Disconnect("frigate event stream ended".to_owned()))
+    }
+
+    async fn on_silent_payments(
+        &mut self,
+        notification: SpNotification,
+        tx: &mut Sender<FrigateEvent>,
+        watch: &mut Watch,
+    ) -> Result<(), Stop> {
+        let mut confirmed_by_height: BTreeMap<u32, Vec<(Txid, PublicKey)>> = BTreeMap::new();
+        let mut mempool = Vec::new();
+        for history in notification.history {
+            if history.height == 0 {
+                mempool.push((history.tx_hash, history.tweak_key));
+            } else {
+                confirmed_by_height
+                    .entry(history.height)
+                    .or_default()
+                    .push((history.tx_hash, history.tweak_key));
+            }
+        }
+
+        for (height, tweaks) in confirmed_by_height {
+            let header =
+                self.client.get_block_header(height).await.map_err(|err| {
+                    Stop::Disconnect(format!("block header {height} failed: {err}"))
+                })?;
+            let blkheight = Height::from_consensus(height)
+                .map_err(|err| Stop::Disconnect(format!("invalid block height {height}: {err}")))?;
+            let blkhash = header.header.block_hash();
+            for (txid, tweak) in tweaks {
+                let Some(discovered_outputs) = self.discover(txid, &tweak).await else {
                     continue;
                 };
-
-                match notification {
-                    Notification::SpSubscribe(sp_subscribe_notification) => {
-                        let histories = sp_subscribe_notification.history;
-                        let progress = sp_subscribe_notification.progress;
-                        let mut secrets_by_height: BTreeMap<u32, HashMap<Txid, PublicKey>> =
-                            BTreeMap::new();
-
-                        debug!("Received history {histories:#?}");
-                        info!("Found a total of {} output(s)", histories.len());
-
-                        for history in &histories {
-                            if history.height == 0 {
-                                debug!("Skipping mempool transaction {}", history.tx_hash);
-                                continue;
-                            }
-
-                            secrets_by_height
-                                .entry(history.height)
-                                .or_default()
-                                .insert(history.tx_hash, history.tweak_key);
-                        }
-
-                        for (height, tx_tweaks) in secrets_by_height {
-                            let blk_header = match self.client.get_block_header(height).await {
-                                Ok(header) => header,
-                                Err(e) => {
-                                    error!("Unable to fetch block header at height {height}: {e}");
-                                    return;
-                                }
-                            };
-                            let blkheight = match Height::from_consensus(height) {
-                                Ok(height) => height,
-                                Err(e) => {
-                                    error!(
-                                        "Invalid block height {height} received from Frigate: {e}"
-                                    );
-                                    return;
-                                }
-                            };
-
-                            for (txid, tweak) in tx_tweaks {
-                                let full_tx = match self.client.get_transaction(txid).await {
-                                    Ok(full_tx) => full_tx,
-                                    Err(e) => {
-                                        warn!(
-                                            "Skipping transaction {txid} after fetch failure: {e}"
-                                        );
-                                        continue;
-                                    }
-                                };
-                                let discovered_outputs = match process_outputs(
-                                    &full_tx.tx,
-                                    &self.b_scan,
-                                    &self.sp_receiver,
-                                    &tweak,
-                                ) {
-                                    Ok(outputs) => outputs,
-                                    Err(e) => {
-                                        warn!("Skipping malformed transaction {txid}: {e}");
-                                        continue;
-                                    }
-                                };
-
-                                self.owned_outpoints.extend(discovered_outputs.keys());
-
-                                if monitor_spent {
-                                    subscribe_outputs(
-                                        &mut self.client,
-                                        &mut tracked_scripts,
-                                        &discovered_outputs,
-                                    )
-                                    .await;
-                                }
-
-                                let scan_res = ScanResult {
-                                    blkheight,
-                                    blkhash: blk_header.header.block_hash(),
-                                    discovered_inputs: HashSet::new(),
-                                    discovered_outputs,
-                                };
-
-                                if let Some(sender) = scan_tx.as_mut() {
-                                    if let Err(e) = sender.send(scan_res).await {
-                                        error!(
-                                            "Unable to send scan result: {e}; stopping scan output"
-                                        );
-                                        scan_tx = None;
-                                        if !monitor_spent {
-                                            return;
-                                        }
-                                    } else {
-                                        info!("Scan result sent!");
-                                    }
-                                }
-                            }
-                        }
-
-                        if progress >= 1.0f32 {
-                            if !monitor_spent {
-                                info!("Scan completed!");
-                                break;
-                            }
-
-                            if scan_tx.take().is_some() {
-                                info!("Scan completed, monitoring spent outputs");
-                            }
-                        }
-                    }
-                    Notification::ScriptHash(notification) if monitor_spent => {
-                        let script_hash = notification.script_hash();
-                        let spent = match confirmed_spent_outpoints(
-                            &mut self.client,
-                            script_hash,
-                            &tracked_scripts,
-                            &mut inspected_txids,
-                        )
-                        .await
-                        {
-                            Ok(spent) => spent,
-                            Err(e) => {
-                                error!(
-                                    "Unable to inspect history for script hash {script_hash}: {e}"
-                                );
-                                continue;
-                            }
-                        };
-
-                        if spent.is_empty() {
-                            continue;
-                        }
-
-                        self.owned_outpoints
-                            .retain(|outpoint| !spent.contains(outpoint));
-                        for outpoints in tracked_scripts.values_mut() {
-                            outpoints.retain(|outpoint| !spent.contains(outpoint));
-                        }
-                        tracked_scripts.retain(|_, outpoints| !outpoints.is_empty());
-
-                        if let Err(e) = spent_tx.send(spent).await {
-                            error!("Unable to send spent output update: {e}; stopping monitor");
-                            return;
-                        }
-                    }
-                    Notification::ScriptHash(_) => {
-                        debug!("Ignoring script-hash notification after finite scan");
-                    }
-                    notification => {
-                        debug!("Ignoring unsupported notification: {notification:?}");
-                    }
+                watch.unconfirmed.remove(&txid);
+                self.note_outputs(watch, &discovered_outputs).await;
+                if !send(
+                    tx,
+                    FrigateEvent::Confirmed(ScanResult {
+                        blkheight,
+                        blkhash,
+                        discovered_inputs: HashSet::new(),
+                        discovered_outputs,
+                    }),
+                )
+                .await
+                {
+                    return Err(Stop::CallerGone);
                 }
             }
-        });
+        }
 
-        (scan_rx, spent_rx)
+        for (txid, tweak) in mempool {
+            let Some(discovered_outputs) = self.discover(txid, &tweak).await else {
+                continue;
+            };
+            self.note_outputs(watch, &discovered_outputs).await;
+            watch.unconfirmed.insert(txid, discovered_outputs.clone());
+            if !send(
+                tx,
+                FrigateEvent::Unconfirmed {
+                    txid,
+                    discovered_outputs,
+                },
+            )
+            .await
+            {
+                return Err(Stop::CallerGone);
+            }
+        }
+
+        if notification.progress >= 1.0 && !watch.caught_up {
+            watch.caught_up = true;
+            info!("Frigate scan caught up");
+            if !send(tx, FrigateEvent::CaughtUp).await {
+                return Err(Stop::CallerGone);
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_script_hash(
+        &mut self,
+        notification: ScriptHashNotification,
+        tx: &mut Sender<FrigateEvent>,
+        watch: &mut Watch,
+    ) -> Result<(), Stop> {
+        let script_hash = notification.script_hash();
+        let events = match script_events(&self.client, script_hash, watch).await {
+            Ok(events) => events,
+            Err(err) => {
+                error!("Unable to inspect history for script hash {script_hash}: {err}");
+                return Ok(());
+            }
+        };
+
+        for event in events {
+            if let FrigateEvent::Spent(ref spent) = event {
+                self.owned_outpoints
+                    .retain(|outpoint| !spent.contains(outpoint));
+                for outpoints in watch.tracked_scripts.values_mut() {
+                    outpoints.retain(|outpoint| !spent.contains(outpoint));
+                }
+                watch
+                    .tracked_scripts
+                    .retain(|_, outpoints| !outpoints.is_empty());
+            }
+            if !send(tx, event).await {
+                return Err(Stop::CallerGone);
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_header(
+        &mut self,
+        header: HeaderNotification,
+        tx: &mut Sender<FrigateEvent>,
+    ) -> Result<(), Stop> {
+        let notified = header.height();
+        let new_height = Height::from_consensus(notified)
+            .map_err(|err| Stop::Disconnect(format!("invalid tip height {notified}: {err}")))?;
+        let new_hash = header.header().block_hash();
+        if new_height < self.tip_height
+            || (new_height == self.tip_height && new_hash != self.tip_hash)
+        {
+            warn!(
+                "Chain tip moved from {} ({}) to {new_height} ({new_hash})",
+                self.tip_height, self.tip_hash
+            );
+        } else if new_hash != self.tip_hash {
+            info!(
+                "Chain tip advanced from {} to {new_height}",
+                self.tip_height
+            );
+        } else {
+            debug!("Header notification repeats tip {new_height}");
+            return Ok(());
+        }
+
+        self.tip_height = new_height;
+        self.tip_hash = new_hash;
+        if !send(
+            tx,
+            FrigateEvent::Tip {
+                height: new_height,
+                hash: new_hash,
+            },
+        )
+        .await
+        {
+            return Err(Stop::CallerGone);
+        }
+        Ok(())
+    }
+
+    async fn discover(
+        &self,
+        txid: Txid,
+        tweak: &PublicKey,
+    ) -> Option<HashMap<OutPoint, DiscoveredOutput>> {
+        let full_tx = match self.client.get_transaction(txid).await {
+            Ok(full_tx) => full_tx,
+            Err(err) => {
+                warn!("Skipping transaction {txid} after fetch failure: {err}");
+                return None;
+            }
+        };
+        match process_outputs(&full_tx.tx, &self.b_scan, &self.sp_receiver, tweak) {
+            Ok(outputs) if outputs.is_empty() => {
+                debug!("No owned outputs in {txid}");
+                None
+            }
+            Ok(outputs) => Some(outputs),
+            Err(err) => {
+                warn!("Skipping malformed transaction {txid}: {err}");
+                None
+            }
+        }
+    }
+
+    async fn note_outputs(
+        &mut self,
+        watch: &mut Watch,
+        discovered_outputs: &HashMap<OutPoint, DiscoveredOutput>,
+    ) {
+        self.owned_outpoints
+            .extend(discovered_outputs.keys().copied());
+        subscribe_outputs(&self.client, &mut watch.tracked_scripts, discovered_outputs).await;
     }
 }
 
-impl Scanner for FrigateScanner {
-    fn scan_blocks(self, range: std::ops::RangeInclusive<Height>) -> Receiver<ScanResult> {
-        let (scan_rx, spent_rx) = self.start_scan(range, false);
-        drop(spent_rx);
-        scan_rx
+async fn send(tx: &mut Sender<FrigateEvent>, event: FrigateEvent) -> bool {
+    tx.send(event).await.is_ok()
+}
+
+async fn script_events(
+    client: &FrigateClient,
+    script_hash: ElectrumScriptHash,
+    watch: &mut Watch,
+) -> anyhow::Result<Vec<FrigateEvent>> {
+    let Some(owned_outpoints) = watch.tracked_scripts.get(&script_hash).cloned() else {
+        return Ok(Vec::new());
+    };
+
+    let history = client.get_history(script_hash).await?;
+    let mut events = Vec::new();
+    let mut spent = HashSet::new();
+    let mut newly_inspected = HashSet::new();
+
+    for entry in history {
+        let Some(height) = entry.confirmation_height() else {
+            continue;
+        };
+        let txid = entry.txid();
+
+        if let Some(discovered_outputs) = watch.unconfirmed.remove(&txid) {
+            match client.get_block_header(height.to_consensus_u32()).await {
+                Ok(header) => events.push(FrigateEvent::Confirmed(ScanResult {
+                    blkheight: height,
+                    blkhash: header.header.block_hash(),
+                    discovered_inputs: HashSet::new(),
+                    discovered_outputs,
+                })),
+                Err(err) => {
+                    error!("Unable to fetch block header at height {height} for {txid}: {err}");
+                    watch.unconfirmed.insert(txid, discovered_outputs);
+                }
+            }
+        }
+
+        let already_inspected = watch
+            .inspected_txids
+            .get(&script_hash)
+            .is_some_and(|seen| seen.contains(&txid));
+        if already_inspected || newly_inspected.contains(&txid) {
+            continue;
+        }
+
+        let full_tx = match client.get_transaction(txid).await {
+            Ok(full_tx) => full_tx,
+            Err(err) => {
+                error!("Unable to fetch transaction {txid}: {err}");
+                continue;
+            }
+        };
+        for input in full_tx.tx.input {
+            if owned_outpoints.contains(&input.previous_output) {
+                spent.insert(input.previous_output);
+            }
+        }
+        newly_inspected.insert(txid);
     }
+
+    if !newly_inspected.is_empty() {
+        watch
+            .inspected_txids
+            .entry(script_hash)
+            .or_default()
+            .extend(newly_inspected);
+    }
+
+    if !spent.is_empty() {
+        events.push(FrigateEvent::Spent(spent));
+    }
+    Ok(events)
 }
 
 async fn subscribe_outputs(
-    client: &mut FrigateClient,
+    client: &FrigateClient,
     tracked_scripts: &mut HashMap<ElectrumScriptHash, HashSet<OutPoint>>,
     discovered_outputs: &HashMap<OutPoint, DiscoveredOutput>,
 ) {
@@ -280,47 +466,13 @@ async fn subscribe_outputs(
         }
 
         let request = request::ScriptHashSubscribe { script_hash };
-        if let Err(e) = client.scripthash_subscribe(request).await {
-            error!("Unable to subscribe to script hash {script_hash}: {e}");
+        if let Err(err) = client.scripthash_subscribe(request).await {
+            error!("Unable to subscribe to script hash {script_hash}: {err}");
         }
     }
 }
 
-async fn confirmed_spent_outpoints(
-    client: &mut FrigateClient,
-    script_hash: ElectrumScriptHash,
-    tracked_scripts: &HashMap<ElectrumScriptHash, HashSet<OutPoint>>,
-    inspected_txids: &mut HashMap<ElectrumScriptHash, HashSet<Txid>>,
-) -> anyhow::Result<HashSet<OutPoint>> {
-    let Some(owned_outpoints) = tracked_scripts.get(&script_hash) else {
-        return Ok(HashSet::new());
-    };
-
-    let inspected_for_script = inspected_txids.entry(script_hash).or_default();
-    let mut spent = HashSet::new();
-    for history_entry in client.get_history(script_hash).await? {
-        if history_entry.confirmation_height().is_none() {
-            continue;
-        }
-
-        let txid = history_entry.txid();
-        if inspected_for_script.contains(&txid) {
-            continue;
-        }
-
-        let full_tx = client.get_transaction(txid).await?;
-        for input in full_tx.tx.input {
-            if owned_outpoints.contains(&input.previous_output) {
-                spent.insert(input.previous_output);
-            }
-        }
-        inspected_for_script.insert(txid);
-    }
-
-    Ok(spent)
-}
-
-fn process_outputs(
+pub fn process_outputs(
     tx: &Transaction,
     b_scan: &SecretKey,
     sp_receiver: &SpReceiver,

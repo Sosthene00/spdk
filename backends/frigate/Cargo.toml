@@ -6,6 +6,9 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+spdk-core.workspace = true
+
+async-trait.workspace = true
 electrum_streaming_client.workspace = true
 bitcoin.workspace = true
 futures.workspace = true

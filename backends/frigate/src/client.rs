@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use bitcoin::absolute::Height;
 use bitcoin::constants::ChainHash;
-use bitcoin::{Network, Txid};
-use electrum_streaming_client::response::{FullTx, HeaderResp};
+use bitcoin::{Block, BlockHash, Network, Txid};
+use electrum_streaming_client::notification::HeaderNotification;
+use electrum_streaming_client::response::{FullTx, HeaderResp, HeadersSubscribeResp};
 use electrum_streaming_client::{
     AsyncClient, ElectrumScriptHash, ElectrumScriptStatus, Event, request,
 };
@@ -13,7 +14,6 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-#[expect(unused, reason = "worker is used to keep the connection alive")]
 pub struct FrigateClient {
     pub client: AsyncClient,
     pub events: UnboundedReceiver<Event>,
@@ -106,13 +106,13 @@ impl FrigateClient {
         })
     }
 
-    /// Returns the height of the chain tip.
+    /// Returns the height and block hash of the chain tip, and subscribe to .
     ///
     /// Electrum exposes the tip through `blockchain.headers.subscribe`. That call also subscribes
     /// this connection to later tip notifications, which arrive on [`Self::events`]. There is no
     /// headers unsubscribe, so those notifications continue until the connection closes. Drain
     /// `events`, or use a connection that is not shared with a scan, if this client stays open.
-    pub async fn block_height(&self) -> Result<Height> {
+    pub async fn subscribe_header(&self) -> Result<HeaderNotification> {
         let res = timeout(
             self.request_timeout,
             self.client.send_request(request::HeadersSubscribe),
@@ -121,8 +121,7 @@ impl FrigateClient {
         .map_err(|_| FrigateError::Timeout("Headers subscribe request timed out".to_owned()))?
         .map_err(|e| FrigateError::Request(format!("Headers subscribe request failed: {e}")))?;
 
-        Height::from_consensus(res.height)
-            .map_err(|e| FrigateError::Request(format!("invalid tip height {}: {e}", res.height)))
+        Ok(res)
     }
 
     pub async fn get_block_header(&self, height: u32) -> Result<HeaderResp> {
