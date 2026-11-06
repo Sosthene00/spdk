@@ -29,8 +29,15 @@ bitcoin = { version = "0.32.8", features = ["serde", "rand", "base64"] }
 bitcoin_hashes = "0.13.0"
 rayon = "1.10.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tokio-rustls = "0.26"
-webpki-roots = "1.0"
+# ring only (no aws_lc_rs): reqwest already enables rustls/ring; a second
+# provider feature would make rustls::ClientConfig::builder() panic on
+# provider ambiguity.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+  "ring",
+  "tls12",
+  "logging",
+] }
+webpki-roots = "0.26"
 futures = "0.3"
 async-trait = "0.1"
 log = "0.4"
