@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use bitcoin::Txid;
+use bitcoin::absolute::Height;
+use bitcoin::constants::ChainHash;
+use bitcoin::{Network, Txid};
 use electrum_streaming_client::response::{FullTx, HeaderResp};
 use electrum_streaming_client::{
     AsyncClient, ElectrumScriptHash, ElectrumScriptStatus, Event, request,
@@ -66,6 +68,49 @@ impl FrigateClient {
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
+    }
+
+    /// Returns the network this server is following.
+    ///
+    /// Identified from the genesis hash in `server.features`. Only the networks known to
+    /// rust-bitcoin are recognized: mainnet, testnet3, testnet4, the default signet, and regtest.
+    /// A custom signet genesis hash is rejected.
+    pub async fn network(&mut self) -> Result<Network> {
+        self.version().await?;
+
+        let res = timeout(
+            self.request_timeout,
+            self.client.send_request(request::Features),
+        )
+        .await
+        .map_err(|_| FrigateError::Timeout("Features request timed out".to_owned()))?
+        .map_err(|e| FrigateError::Request(format!("Features request failed: {e}")))?;
+
+        let chain_hash = ChainHash::from_genesis_block_hash(res.genesis_hash);
+        Network::from_chain_hash(chain_hash).ok_or_else(|| {
+            FrigateError::Request(format!("unrecognized genesis hash {}", res.genesis_hash))
+        })
+    }
+
+    /// Returns the height of the chain tip.
+    ///
+    /// Electrum exposes the tip through `blockchain.headers.subscribe`. That call also subscribes
+    /// this connection to later tip notifications, which arrive on [`Self::events`]. There is no
+    /// headers unsubscribe, so those notifications continue until the connection closes. Drain
+    /// `events`, or use a connection that is not shared with a scan, if this client stays open.
+    pub async fn block_height(&mut self) -> Result<Height> {
+        self.version().await?;
+
+        let res = timeout(
+            self.request_timeout,
+            self.client.send_request(request::HeadersSubscribe),
+        )
+        .await
+        .map_err(|_| FrigateError::Timeout("Headers subscribe request timed out".to_owned()))?
+        .map_err(|e| FrigateError::Request(format!("Headers subscribe request failed: {e}")))?;
+
+        Height::from_consensus(res.height)
+            .map_err(|e| FrigateError::Request(format!("invalid tip height {}: {e}", res.height)))
     }
 
     pub async fn get_block_header(&mut self, height: u32) -> Result<HeaderResp> {
