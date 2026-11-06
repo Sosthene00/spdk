@@ -51,7 +51,11 @@ impl FrigateClient {
     ///
     /// `request_timeout` applies to that handshake and to every later request. The handshake is
     /// the first request on the connection. If it fails, the reader task is aborted.
-    pub async fn connect(host_url: &str, request_timeout: Duration) -> Result<Self> {
+    pub async fn connect(host_url: &str, request_timeout: Option<Duration>) -> Result<Self> {
+        let request_timeout: Duration = match request_timeout {
+            Some(t) => t,
+            None => Self::DEFAULT_REQUEST_TIMEOUT,
+        };
         let stream = TcpStream::connect(host_url).await.map_err(|err| {
             FrigateError::Connection(format!("can't connect to socket '{host_url}': {err}"))
         })?;

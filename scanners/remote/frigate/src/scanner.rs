@@ -32,7 +32,7 @@ impl FrigateScanner {
         labels: Option<Vec<u32>>,
         owned_outpoints: HashSet<OutPoint>,
     ) -> anyhow::Result<Self> {
-        let client = FrigateClient::connect(&host_url).await?;
+        let client = FrigateClient::connect(&host_url, None).await?;
         Ok(Self {
             client,
             b_scan,
