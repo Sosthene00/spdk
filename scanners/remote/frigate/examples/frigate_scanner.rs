@@ -4,6 +4,7 @@ use bitcoin::absolute::Height;
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::{BlockHash, Network, OutPoint};
 use frigate::Scanner;
+use futures::StreamExt as _;
 use spdk_core::scanner::{DiscoveredOutput, Scanner as _};
 use spdk_wallet::client::{SpClient, SpendKey};
 
@@ -54,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     // Call `scan_blocks_with_spent_outputs` instead if you want to monitor spent outputs as well.
     let mut rx = frigate_scanner.scan_blocks(start..=end);
 
-    while let Ok(update) = rx.recv().await {
+    while let Some(update) = rx.next().await {
         // print all received updates
         println!("{update:#?}");
     }
