@@ -3,12 +3,12 @@ use std::time::Duration;
 use anyhow::Result;
 use bitcoin::absolute::Height;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::{Amount, Txid};
+use bitcoin::{Amount, BlockHash, Txid};
 use reqwest::{Client, Url};
 
 use super::api_structs::{
-    BlockHeightResponse, FilterResponse, ForwardTxRequest, InfoResponse, SpentIndexResponse,
-    UtxoResponse,
+    BlockHashResponse, BlockHeightResponse, FilterResponse, ForwardTxRequest, InfoResponse,
+    SpentIndexResponse, UtxoResponse,
 };
 
 #[derive(Clone, Debug)]
@@ -41,6 +41,19 @@ impl BlindbitClient {
             .await?;
         let blkheight: BlockHeightResponse = serde_json::from_str(&res.text().await?)?;
         Ok(blkheight.block_height)
+    }
+
+    pub async fn block_hash(&self, block_height: Height) -> Result<BlockHash> {
+        let url = self.host_url.join(&format!("block-hash/{block_height}"))?;
+
+        let res = self
+            .client
+            .get(url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        let blkhash: BlockHashResponse = serde_json::from_str(&res.text().await?)?;
+        Ok(blkhash.block_hash)
     }
 
     pub async fn tweaks(&self, block_height: Height, dust_limit: Amount) -> Result<Vec<PublicKey>> {

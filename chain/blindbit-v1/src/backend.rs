@@ -36,6 +36,10 @@ impl BlindbitBackend {
         self.client.block_height().await
     }
 
+    pub async fn block_hash(&self, block_height: Height) -> Result<BlockHash> {
+        self.client.block_hash(block_height).await
+    }
+
     pub async fn forward_tx(&self, tx_hex: String) -> Result<Txid> {
         self.client.forward_tx(tx_hex).await
     }

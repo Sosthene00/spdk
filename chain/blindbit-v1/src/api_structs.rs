@@ -11,6 +11,11 @@ pub struct BlockHeightResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct BlockHashResponse {
+    pub block_hash: BlockHash,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UtxoResponse {
     pub txid: Txid,
     pub vout: u32,
