@@ -56,11 +56,14 @@ async fn simple_scan_single_block() {
     assert_eq!(updates.len(), 1);
 
     // block info is consistent
-    assert_eq!(updates[0].blkheight, block_height);
-    assert_eq!(updates[0].blkhash, block_hash);
+    let update = updates[0]
+        .as_ref()
+        .expect("scan must complete without errors");
+    assert_eq!(update.blkheight, block_height);
+    assert_eq!(update.blkhash, block_hash);
     // update does not contain any relevant transaction info
-    assert!(updates[0].discovered_inputs.is_empty());
-    assert!(updates[0].discovered_outputs.is_empty());
+    assert!(update.discovered_inputs.is_empty());
+    assert!(update.discovered_outputs.is_empty());
 }
 
 #[tokio::test]
@@ -107,12 +110,18 @@ async fn simple_scan_multiple_blocks() {
     assert_eq!(updates.len(), 2);
 
     // the first update relates to the first block
-    assert_eq!(updates[0].blkheight, first_block_height);
-    assert_eq!(updates[0].blkhash, first_block_hash);
+    let first = updates[0]
+        .as_ref()
+        .expect("scan must complete without errors");
+    assert_eq!(first.blkheight, first_block_height);
+    assert_eq!(first.blkhash, first_block_hash);
 
     // the second update relates to the second block
-    assert_eq!(updates[1].blkheight, second_block_height);
-    assert_eq!(updates[1].blkhash, second_block_hash);
+    let second = updates[1]
+        .as_ref()
+        .expect("scan must complete without errors");
+    assert_eq!(second.blkheight, second_block_height);
+    assert_eq!(second.blkhash, second_block_hash);
 }
 
 #[tokio::test]
@@ -170,7 +179,10 @@ async fn scan_single_block_with_output() {
     assert_eq!(updates.len(), 1);
 
     // update should contain a single output for this key pair
-    let discovered_outputs = &updates[0].discovered_outputs;
+    let update = updates[0]
+        .as_ref()
+        .expect("scan must complete without errors");
+    let discovered_outputs = &update.discovered_outputs;
     assert_eq!(discovered_outputs.len(), 1);
 
     let discovered_output = discovered_outputs.get(&expected_outpoint);
@@ -226,7 +238,10 @@ async fn scan_single_block_with_spent_input() {
     // assert we received a single update
     assert_eq!(updates.len(), 1);
 
-    let discovered_inputs = &updates[0].discovered_inputs;
+    let update = updates[0]
+        .as_ref()
+        .expect("scan must complete without errors");
+    let discovered_inputs = &update.discovered_inputs;
 
     // we discovered that our owned outpoint has been spent
     assert_eq!(discovered_inputs.len(), 1);

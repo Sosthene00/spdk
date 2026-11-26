@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
+use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use bitcoin::absolute::Height;
 use bitcoin::{Amount, BlockHash, OutPoint, Txid};
-use futures::{Stream, StreamExt as _, stream};
+use futures::{FutureExt as _, Stream, StreamExt as _, future::Shared, stream};
 use spdk_core::chain::{BoxedBlockData, ChainBackend, SpentIndexData, UtxoData};
 
 use crate::BackendInfo;
@@ -15,6 +16,47 @@ use crate::structs::BlindbitV1BlockData;
 use crate::utils::input_hashes_map;
 
 const CONCURRENT_FILTER_REQUESTS: usize = 200;
+
+/// Which tweaks endpoint the server actually serves, resolved once per
+/// `get_block_data_for_range` call from the server's `/info` capabilities.
+///
+/// Blindbit deployments differ: cut-through builds serve `/tweaks` with a
+/// dust filter, full-index builds serve `/tweak-index` (with or without
+/// dust-filter support). Asking a server for an endpoint it does not support
+/// yields either a hard rejection or a silent empty list — the latter once
+/// made whole wallets scan "successfully" without discovering anything.
+#[derive(Debug, Clone, Copy)]
+enum TweakSource {
+    /// Cut-through tweaks with the client's dust limit (`/tweaks?dustLimit=`).
+    CutThrough,
+    /// Full tweak index (`/tweak-index`), optionally dust-filtered.
+    FullIndex { with_dust: bool },
+}
+
+async fn resolve_tweak_source(
+    client: BlindbitClient,
+    with_cutthrough: bool,
+) -> Result<TweakSource> {
+    let info = client.info().await?;
+    if with_cutthrough && info.tweaks_cut_through_with_dust_filter {
+        return Ok(TweakSource::CutThrough);
+    }
+    if info.tweaks_full_with_dust_filter {
+        return Ok(TweakSource::FullIndex { with_dust: true });
+    }
+    if info.tweaks_full_basic {
+        return Ok(TweakSource::FullIndex { with_dust: false });
+    }
+    bail!(
+        "blindbit server serves no usable tweaks endpoint for full scanning \
+         (tweaks_only={}, tweaks_full_basic={}, tweaks_full_with_dust_filter={}, \
+         tweaks_cut_through_with_dust_filter={}) — refusing to scan blindly",
+        info.tweaks_only,
+        info.tweaks_full_basic,
+        info.tweaks_full_with_dust_filter,
+        info.tweaks_cut_through_with_dust_filter
+    )
+}
 
 #[derive(Debug)]
 pub struct BlindbitBackend {
@@ -62,16 +104,34 @@ impl ChainBackend for BlindbitBackend {
         // convert range to u32 since Height does not implement Step
         let range = range.start().to_consensus_u32()..=range.end().to_consensus_u32();
 
+        // Probe the server's capabilities once and share the result across
+        // every block future (`Shared` starts the underlying future on the
+        // first poll and hands the outcome to all clones; the `Arc` wrapper
+        // keeps the shared output `Clone` despite `anyhow::Error`).
+        let probe: Shared<_> = resolve_tweak_source(client.clone(), with_cutthrough)
+            .map(Arc::new)
+            .shared();
+
         let res = stream::iter(range)
             .map(move |n| {
                 let client = client.clone();
+                let probe = probe.clone();
 
                 async move {
                     let blkheight = Height::from_consensus(n)?;
-                    let tweaks = if with_cutthrough {
-                        client.tweaks(blkheight, dust_limit).await?
-                    } else {
-                        client.tweak_index(blkheight, dust_limit).await?
+                    let source: TweakSource = match probe.clone().await.as_ref() {
+                        Ok(source) => *source,
+                        Err(e) => return Err(anyhow!("{e:#}")),
+                    };
+                    let tweaks = match source {
+                        TweakSource::CutThrough => {
+                            client.tweaks(blkheight, Some(dust_limit)).await?
+                        }
+                        TweakSource::FullIndex { with_dust } => {
+                            client
+                                .tweak_index(blkheight, with_dust.then_some(dust_limit))
+                                .await?
+                        }
                     };
                     let new_utxo_filter = client.filter_new_utxos(blkheight).await?;
                     let spent_filter = client.filter_spent(blkheight).await?;

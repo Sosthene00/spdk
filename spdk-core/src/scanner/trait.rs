@@ -6,5 +6,5 @@ use futures::channel::mpsc::Receiver;
 use crate::scanner::structs::ScanResult;
 
 pub trait Scanner {
-    fn scan_blocks(self, range: RangeInclusive<Height>) -> Receiver<ScanResult>;
+    fn scan_blocks(self, range: RangeInclusive<Height>) -> Receiver<anyhow::Result<ScanResult>>;
 }

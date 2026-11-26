@@ -1,15 +1,91 @@
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use bitcoin::absolute::Height;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, BlockHash, Txid};
 use reqwest::{Client, Url};
+use serde::de::DeserializeOwned;
 
 use super::api_structs::{
     BlockHashResponse, BlockHeightResponse, FilterResponse, ForwardTxRequest, InfoResponse,
     SpentIndexResponse, UtxoResponse,
 };
+
+/// A blindbit server answered with an error we understood.
+///
+/// Blindbit backends report failures as `{"error": "<message>"}` bodies
+/// (normally with a non-2xx status). Surfacing them typed — status plus the
+/// server's own message — lets callers distinguish server-side rejections
+/// from transport or parse failures instead of staring at serde noise like
+/// "invalid type: map, expected a sequence".
+#[derive(Debug)]
+pub struct ServerError {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "blindbit server error (HTTP {}): {}",
+            self.status, self.message
+        )
+    }
+}
+
+impl std::error::Error for ServerError {}
+
+/// Detects a blindbit error envelope: a JSON *object* carrying an `error`
+/// string. (A plain `serde` struct match is not enough — derived
+/// deserializers also accept sequences positionally, which would swallow
+/// single-element tweak arrays like `["03.."]` as `{"error": "03.."}`.)
+fn error_envelope(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value.as_object()?.get("error")?.as_str().map(str::to_owned)
+}
+
+/// Performs a GET and decodes the JSON body, treating blindbit error
+/// envelopes (`{"error": ...}`) as typed [`ServerError`]s regardless of the
+/// HTTP status — an error map is never a valid endpoint payload.
+async fn get_json<T: DeserializeOwned>(client: &Client, url: Url) -> Result<T> {
+    let res = client
+        .get(url.clone())
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await?;
+    decode_response::<T>(res, url).await
+}
+
+async fn decode_response<T: DeserializeOwned>(res: reqwest::Response, url: Url) -> Result<T> {
+    let status = res.status();
+    let text = res.text().await?;
+    if let Some(message) = error_envelope(&text) {
+        return Err(anyhow::Error::new(ServerError {
+            status: status.as_u16(),
+            message,
+        }));
+    }
+    if !status.is_success() {
+        anyhow::bail!("blindbit server returned HTTP {status} for {url}: {text}");
+    }
+    serde_json::from_str(&text)
+        .with_context(|| format!("unexpected response body from {url}: {text}"))
+}
+
+/// Appends the dustLimit query only when the caller actually wants one.
+///
+/// Servers without dust-filter support reject the parameter outright
+/// ("Server does not allow dustLimits") or silently ignore it; callers probe
+/// `/info` and omit it when unsupported.
+fn with_dust_limit(mut url: Url, dust_limit: Option<Amount>) -> Url {
+    if let Some(dust_limit) = dust_limit {
+        url.query_pairs_mut()
+            .append_pair("dustLimit", &dust_limit.to_sat().to_string());
+    }
+    url
+}
 
 #[derive(Clone, Debug)]
 pub struct BlindbitClient {
@@ -58,90 +134,66 @@ impl BlindbitClient {
 
     pub async fn block_height(&self) -> Result<Height> {
         let url = self.host_url.join("block-height")?;
-
-        let res = self
-            .client
-            .get(url)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await?;
-        let blkheight: BlockHeightResponse = serde_json::from_str(&res.text().await?)?;
-        Ok(blkheight.block_height)
+        Ok(get_json::<BlockHeightResponse>(&self.client, url)
+            .await?
+            .block_height)
     }
 
     pub async fn block_hash(&self, block_height: Height) -> Result<BlockHash> {
         let url = self.host_url.join(&format!("block-hash/{block_height}"))?;
-
-        let res = self
-            .client
-            .get(url)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await?;
-        let blkhash: BlockHashResponse = serde_json::from_str(&res.text().await?)?;
-        Ok(blkhash.block_hash)
+        Ok(get_json::<BlockHashResponse>(&self.client, url)
+            .await?
+            .block_hash)
     }
 
-    pub async fn tweaks(&self, block_height: Height, dust_limit: Amount) -> Result<Vec<PublicKey>> {
+    /// Cut-through tweaks for a block, filtered server-side by `dust_limit`
+    /// when one is requested. Only meaningful on servers that report
+    /// `tweaks_cut_through_with_dust_filter: true`; elsewhere the endpoint
+    /// may answer a silent empty list, so callers must consult `/info`
+    /// before choosing it.
+    pub async fn tweaks(
+        &self,
+        block_height: Height,
+        dust_limit: Option<Amount>,
+    ) -> Result<Vec<PublicKey>> {
         let url = self.host_url.join(&format!("tweaks/{block_height}"))?;
-
-        let res = self
-            .client
-            .get(url)
-            .query(&[("dustLimit", format!("{}", dust_limit.to_sat()))])
-            .send()
-            .await?;
-        Ok(serde_json::from_str(&res.text().await?)?)
+        get_json(&self.client, with_dust_limit(url, dust_limit)).await
     }
 
+    /// Full tweak index for a block. The `dustLimit` query is sent only when
+    /// the server reports dust-filter support (`tweaks_full_with_dust_filter`);
+    /// servers without it reject any non-zero dustLimit outright.
     pub async fn tweak_index(
         &self,
         block_height: Height,
-        dust_limit: Amount,
+        dust_limit: Option<Amount>,
     ) -> Result<Vec<PublicKey>> {
         let url = self.host_url.join(&format!("tweak-index/{block_height}"))?;
-
-        let res = self
-            .client
-            .get(url)
-            .query(&[("dustLimit", format!("{}", dust_limit.to_sat()))])
-            .send()
-            .await?;
-        Ok(serde_json::from_str(&res.text().await?)?)
+        get_json(&self.client, with_dust_limit(url, dust_limit)).await
     }
 
     pub async fn utxos(&self, block_height: Height) -> Result<Vec<UtxoResponse>> {
         let url = self.host_url.join(&format!("utxos/{block_height}"))?;
-        let res = self.client.get(url).send().await?;
-
-        Ok(serde_json::from_str(&res.text().await?)?)
+        get_json(&self.client, url).await
     }
 
     pub async fn spent_index(&self, block_height: Height) -> Result<SpentIndexResponse> {
         let url = self.host_url.join(&format!("spent-index/{block_height}"))?;
-        let res = self.client.get(url).send().await?;
-
-        Ok(serde_json::from_str(&res.text().await?)?)
+        get_json(&self.client, url).await
     }
 
     pub async fn filter_new_utxos(&self, block_height: Height) -> Result<FilterResponse> {
         let url = self
             .host_url
             .join(&format!("filter/new-utxos/{block_height}"))?;
-
-        let res = self.client.get(url).send().await?;
-
-        Ok(serde_json::from_str(&res.text().await?)?)
+        get_json(&self.client, url).await
     }
 
     pub async fn filter_spent(&self, block_height: Height) -> Result<FilterResponse> {
         let url = self
             .host_url
             .join(&format!("filter/spent/{block_height}"))?;
-
-        let res = self.client.get(url).send().await?;
-
-        Ok(serde_json::from_str(&res.text().await?)?)
+        get_json(&self.client, url).await
     }
 
     pub async fn forward_tx(&self, tx_hex: String) -> Result<Txid> {
@@ -149,16 +201,13 @@ impl BlindbitClient {
 
         let body = ForwardTxRequest::new(tx_hex);
 
-        let res = self.client.post(url).json(&body).send().await?;
-
-        Ok(serde_json::from_str(&res.text().await?)?)
+        let res = self.client.post(url.clone()).json(&body).send().await?;
+        decode_response::<Txid>(res, url).await
     }
 
     pub async fn info(&self) -> Result<InfoResponse> {
         let url = self.host_url.join("info")?;
-
-        let res = self.client.get(url).send().await?;
-        Ok(serde_json::from_str(&res.text().await?)?)
+        get_json(&self.client, url).await
     }
 }
 

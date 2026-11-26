@@ -1,6 +1,6 @@
 pub mod api_structs;
 mod backend;
-mod client;
+pub mod client;
 pub mod structs;
 pub mod utils;
 

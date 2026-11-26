@@ -19,6 +19,7 @@ tokio.workspace = true
 rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
+anyhow.workspace = true
 spdk-wallet.workspace = true
 backend-blindbit-v1.workspace = true
 async-trait.workspace = true

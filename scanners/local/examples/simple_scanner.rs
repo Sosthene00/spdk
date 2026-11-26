@@ -64,8 +64,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rx = scanner.scan_blocks(start..=end);
 
     while let Some(update) = rx.next().await {
-        // print all received updates
-        println!("{update:#?}");
+        match update {
+            Ok(update) => println!("{update:#?}"),
+            // Box<dyn Error> return type: wrap the message instead of
+            // bailing with anyhow::Error.
+            Err(e) => return Err(format!("scan failed: {e:#}").into()),
+        }
     }
 
     Ok(())

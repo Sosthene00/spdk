@@ -54,7 +54,7 @@ impl SpScanner {
 }
 
 impl Scanner for SpScanner {
-    fn scan_blocks(self, range: RangeInclusive<Height>) -> Receiver<ScanResult> {
+    fn scan_blocks(self, range: RangeInclusive<Height>) -> Receiver<Result<ScanResult>> {
         info!(
             "start: {} end: {}",
             range.start().to_consensus_u32(),
@@ -80,10 +80,13 @@ impl Scanner for SpScanner {
         let keep_scanning = self.keep_scanning;
 
         task::spawn(async move {
+            let mut tx = tx;
             match process_block_data_stream(
                 block_data_stream,
                 backend,
-                tx,
+                // A clone goes to the processing loop; the original stays
+                // here to surface a premature end as an error item.
+                tx.clone(),
                 b_scan,
                 sp_receiver,
                 owned_outpoints,
@@ -95,7 +98,13 @@ impl Scanner for SpScanner {
                     "Blindbit scan complete in {} seconds",
                     start_time.elapsed().as_secs()
                 ),
-                Err(e) => warn!("Scan ended prematurely: {e}"),
+                Err(e) => {
+                    warn!("Scan ended prematurely: {e}");
+                    // Surface the failure to the consumer: a scan that did
+                    // not complete must never look like a successful empty
+                    // scan ("complete, 0 tweaks processed").
+                    let _ = tx.send(Err(e)).await;
+                }
             }
         });
 
@@ -106,7 +115,7 @@ impl Scanner for SpScanner {
 async fn process_block_data_stream(
     block_data_stream: impl Stream<Item = Result<BoxedBlockData>>,
     backend: BoxedChainBackend,
-    mut tx: Sender<ScanResult>,
+    mut tx: Sender<Result<ScanResult>>,
     b_scan: SecretKey,
     sp_receiver: SpReceiver,
     mut owned_outpoints: HashSet<OutPoint>,
@@ -139,12 +148,12 @@ async fn process_block_data_stream(
         )
         .await?;
 
-        tx.send(ScanResult {
+        tx.send(Ok(ScanResult {
             blkheight,
             blkhash,
             discovered_inputs,
             discovered_outputs,
-        })
+        }))
         .await?;
     }
 
