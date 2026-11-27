@@ -55,19 +55,21 @@ impl BlindbitClient {
         Ok(serde_json::from_str(&res.text().await?)?)
     }
 
+    /// Fetch the full basic tweak index for a block. The Blindbit basic
+    /// flavor serves the unfiltered index: `dust_limit` must be `None`
+    /// and NO `dustLimit` query parameter is sent in that case.
     pub async fn tweak_index(
         &self,
         block_height: Height,
-        dust_limit: Amount,
+        dust_limit: Option<Amount>,
     ) -> Result<Vec<PublicKey>> {
         let url = self.host_url.join(&format!("tweak-index/{block_height}"))?;
 
-        let res = self
-            .client
-            .get(url)
-            .query(&[("dustLimit", format!("{}", dust_limit.to_sat()))])
-            .send()
-            .await?;
+        let mut req = self.client.get(url);
+        if let Some(dust_limit) = dust_limit {
+            req = req.query(&[("dustLimit", format!("{}", dust_limit.to_sat()))]);
+        }
+        let res = req.send().await?;
         Ok(serde_json::from_str(&res.text().await?)?)
     }
 

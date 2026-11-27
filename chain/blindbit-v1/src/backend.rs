@@ -85,15 +85,39 @@ impl ChainBackend for BlindbitBackend {
                     // Lazy capability probe: the first block item triggers a
                     // single /info request; concurrent items share it and
                     // later ranges reuse the retained response.
-                    let _capabilities = info
+                    let capabilities = info
                         .get_or_try_init(|| probe_info(client.clone()))
                         .await?
                         .clone();
-                    let tweaks = if with_cutthrough {
-                        client.tweaks(blkheight, dust_limit).await?
-                    } else {
-                        client.tweak_index(blkheight, dust_limit).await?
+                    // Request-flavor selection per the probed capability
+                    // flags. `with_cutthrough` is advisory only: the
+                    // capability the server actually serves wins, so a
+                    // hardcoded cut-through request can never force a
+                    // flavor the backend does not provide.
+                    let flavor = select_flavor(&capabilities, with_cutthrough)?;
+                    let tweaks = match flavor {
+                        TweakFlavor::CutThrough => {
+                            client.tweaks(blkheight, dust_limit).await?
+                        }
+                        TweakFlavor::BasicIndex => {
+                            // Basic flavor serves the FULL index: no
+                            // dustLimit query parameter is sent.
+                            client.tweak_index(blkheight, None).await?
+                        }
                     };
+                    // Runtime sanity probe: an empty result from the
+                    // cut-through flavor is cross-checked against the
+                    // basic index; a discrepancy means the backend is
+                    // lying about its capability flags.
+                    if tweaks.is_empty() && matches!(flavor, TweakFlavor::CutThrough) {
+                        let cross_check = client.tweak_index(blkheight, None).await?;
+                        if !cross_check.is_empty() {
+                            bail!(
+                                "backend lying about capabilities: /tweaks (cut-through) returned 0 tweaks for block {blkheight} but /tweak-index returned {}",
+                                cross_check.len()
+                            );
+                        }
+                    }
                     let new_utxo_filter = client.filter_new_utxos(blkheight).await?;
                     let spent_filter = client.filter_spent(blkheight).await?;
                     let blkhash = new_utxo_filter.block_hash;
@@ -165,4 +189,47 @@ async fn probe_info(client: BlindbitClient) -> Result<InfoResponse> {
         info.tweaks_cut_through_with_dust_filter
     );
     Ok(info)
+}
+
+/// The tweak-request flavor selected for this backend, based on the
+/// server's advertised capability flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TweakFlavor {
+    /// `/tweaks/{h}?dustLimit=N` — cut-through with server-side dust filter.
+    CutThrough,
+    /// `/tweak-index/{h}` — full basic index, NO dustLimit parameter.
+    BasicIndex,
+}
+
+/// Choose the request flavor the server actually serves. The requested
+/// flavor (`with_cutthrough`) is preferred when the server supports it,
+/// but capability wins: an unsupported request is never sent. If the
+/// server advertises no compatible flavor at all, this fails loudly —
+/// a blind scan that silently returns zero tweaks is never acceptable.
+fn select_flavor(info: &InfoResponse, with_cutthrough: bool) -> Result<TweakFlavor> {
+    let cut_through_served = info.tweaks_cut_through_with_dust_filter;
+    let basic_served = info.tweaks_full_basic;
+
+    let flavor = if with_cutthrough {
+        if cut_through_served {
+            TweakFlavor::CutThrough
+        } else if basic_served {
+            TweakFlavor::BasicIndex
+        } else {
+            bail!(
+                "blindbit backend serves no compatible tweak index (tweaks_full_basic={basic_served} \
+                 tweaks_cut_through_with_dust_filter={cut_through_served})"
+            );
+        }
+    } else if basic_served {
+        TweakFlavor::BasicIndex
+    } else if cut_through_served {
+        TweakFlavor::CutThrough
+    } else {
+        bail!(
+            "blindbit backend serves no compatible tweak index (tweaks_full_basic={basic_served} \
+                 tweaks_cut_through_with_dust_filter={cut_through_served})"
+        );
+    };
+    Ok(flavor)
 }
