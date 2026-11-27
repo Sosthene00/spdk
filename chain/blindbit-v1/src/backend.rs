@@ -8,8 +8,10 @@ use bitcoin::absolute::Height;
 use bitcoin::{Amount, BlockHash, OutPoint, Txid};
 use futures::{Stream, StreamExt as _, stream};
 use spdk_core::chain::{BoxedBlockData, ChainBackend, SpentIndexData, UtxoData};
+use tokio::sync::OnceCell;
 
 use crate::BackendInfo;
+use crate::api_structs::InfoResponse;
 use crate::client::BlindbitClient;
 use crate::structs::BlindbitV1BlockData;
 use crate::utils::input_hashes_map;
@@ -19,17 +21,31 @@ const CONCURRENT_FILTER_REQUESTS: usize = 200;
 #[derive(Debug)]
 pub struct BlindbitBackend {
     client: BlindbitClient,
+    /// Lazily probed and retained /info response; shared by all
+    /// subsequent requests on this backend.
+    info: OnceCell<InfoResponse>,
 }
 
 impl BlindbitBackend {
     pub fn new(host_url: &str) -> Result<Self> {
         Ok(Self {
             client: BlindbitClient::new(host_url)?,
+            info: OnceCell::new(),
         })
     }
 
     pub async fn info(&self) -> Result<BackendInfo> {
-        self.client.info().await
+        Ok(self.capabilities().await?.clone())
+    }
+
+    /// Probe the backend's `/info` endpoint exactly once and retain the
+    /// full `InfoResponse` for the lifetime of this backend. Concurrent
+    /// callers share a single probe; failures are retried on the next
+    /// call.
+    async fn capabilities(&self) -> Result<&InfoResponse> {
+        self.info
+            .get_or_try_init(|| probe_info(self.client.clone()))
+            .await
     }
 
     pub async fn block_height(&self) -> Result<Height> {
@@ -54,6 +70,7 @@ impl ChainBackend for BlindbitBackend {
         with_cutthrough: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<BoxedBlockData>> + Send>> {
         let client = self.client.clone();
+        let info = self.info.clone();
 
         // convert range to u32 since Height does not implement Step
         let range = range.start().to_consensus_u32()..=range.end().to_consensus_u32();
@@ -61,9 +78,17 @@ impl ChainBackend for BlindbitBackend {
         let res = stream::iter(range)
             .map(move |n| {
                 let client = client.clone();
+                let info = info.clone();
 
                 async move {
                     let blkheight = Height::from_consensus(n)?;
+                    // Lazy capability probe: the first block item triggers a
+                    // single /info request; concurrent items share it and
+                    // later ranges reuse the retained response.
+                    let _capabilities = info
+                        .get_or_try_init(|| probe_info(client.clone()))
+                        .await?
+                        .clone();
                     let tweaks = if with_cutthrough {
                         client.tweaks(blkheight, dust_limit).await?
                     } else {
@@ -121,4 +146,23 @@ impl ChainBackend for BlindbitBackend {
             .map(TryInto::try_into)
             .collect()
     }
+}
+
+/// Fetch and retain the backend's capability flags: a single `/info`
+/// request whose full `InfoResponse` is cached by the caller (via a
+/// `OnceCell`) and logged once per process.
+async fn probe_info(client: BlindbitClient) -> Result<InfoResponse> {
+    let info = client.info().await?;
+    log::info!(
+        "blindbit capability probe: network={} height={} tweaks_only={} \
+         tweaks_full_basic={} tweaks_full_with_dust_filter={} \
+         tweaks_cut_through_with_dust_filter={}",
+        info.network,
+        info.height,
+        info.tweaks_only,
+        info.tweaks_full_basic,
+        info.tweaks_full_with_dust_filter,
+        info.tweaks_cut_through_with_dust_filter
+    );
+    Ok(info)
 }

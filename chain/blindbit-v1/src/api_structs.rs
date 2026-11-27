@@ -78,7 +78,7 @@ impl ForwardTxRequest {
 }
 
 #[expect(clippy::struct_excessive_bools)]
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct InfoResponse {
     #[serde(deserialize_with = "deserialize_network")]
     pub network: Network,
