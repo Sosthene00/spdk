@@ -76,12 +76,23 @@ impl ChainBackend for BlindbitBackend {
         let range = range.start().to_consensus_u32()..=range.end().to_consensus_u32();
 
         let res = stream::iter(range)
-            .map(move |n| {
+            .filter_map(move |n| {
                 let client = client.clone();
                 let info = info.clone();
 
                 async move {
-                    let blkheight = Height::from_consensus(n)?;
+                    // blindbit v1 never indexes the genesis block: its index
+                    // starts at height 1 and the tweak/filter endpoints hard-
+                    // error (500) for height 0. The genesis block provably
+                    // contains no silent-payment data (a single unspendable
+                    // coinbase output, no taproot, no tweaks), so skip it
+                    // instead of failing every 0..=tip rescan at its first
+                    // block.
+                    if n == 0 {
+                        return None;
+                    }
+                    Some(async move {
+                        let blkheight = Height::from_consensus(n)?;
                     // Lazy capability probe: the first block item triggers a
                     // single /info request; concurrent items share it and
                     // later ranges reuse the retained response.
@@ -128,6 +139,7 @@ impl ChainBackend for BlindbitBackend {
                         new_utxo_filter: new_utxo_filter.into(),
                         spent_filter: spent_filter.into(),
                     }) as BoxedBlockData)
+                    })
                 }
             })
             .buffered(CONCURRENT_FILTER_REQUESTS);

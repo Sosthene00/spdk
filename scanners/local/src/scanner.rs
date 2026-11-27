@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use anyhow::Result;
 use bitcoin::absolute::Height;
+use bitcoin::hashes::Hash as _;
 use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
-use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut, Txid, XOnlyPublicKey};
+use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, TxOut, Txid, XOnlyPublicKey};
 use futures::channel::mpsc::{Receiver, Sender, channel};
 use futures::{SinkExt as _, Stream, StreamExt as _, pin_mut};
 use log::{info, warn};
@@ -70,6 +71,7 @@ impl Scanner for SpScanner {
         let sp_receiver = self.sp_receiver;
 
         // get block data stream
+        let range_end = *range.end();
         let block_data_stream =
             self.backend
                 .get_block_data_for_range(range, dust_limit, with_cutthrough);
@@ -88,6 +90,7 @@ impl Scanner for SpScanner {
                 sp_receiver,
                 owned_outpoints,
                 keep_scanning,
+                range_end,
             )
             .await
             {
@@ -103,6 +106,7 @@ impl Scanner for SpScanner {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_block_data_stream(
     block_data_stream: impl Stream<Item = Result<BoxedBlockData>>,
     backend: BoxedChainBackend,
@@ -111,11 +115,17 @@ async fn process_block_data_stream(
     sp_receiver: SpReceiver,
     mut owned_outpoints: HashSet<OutPoint>,
     keep_scanning: &AtomicBool,
+    range_end: Height,
 ) -> Result<()> {
     pin_mut!(block_data_stream);
 
     let mut tweak_count = 0;
     let mut block_count = 0;
+    // First per-block failure, if any. A single failed block must not abort
+    // the rest of the range (transient errors, one unindexable block), but a
+    // failed scan must never look like a healthy completion — the first
+    // error is reported to the consumer as a terminal marker at stream end.
+    let mut first_error: Option<anyhow::Error> = None;
 
     while let Some(blockdata) = block_data_stream.next().await {
         // if interrupt requested: stop scanning and return
@@ -123,33 +133,73 @@ async fn process_block_data_stream(
             break;
         }
 
-        let blockdata = blockdata?;
+        let blockdata = match blockdata {
+            Ok(blockdata) => blockdata,
+            Err(e) => {
+                warn!("block data fetch failed: {e:#}");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+                continue;
+            }
+        };
         let blkhash = blockdata.blkhash();
         let blkheight = blockdata.blkheight();
 
         tweak_count += blockdata.tweaks().len();
         block_count += 1;
 
-        let (discovered_outputs, discovered_inputs) = process_block(
-            &blockdata,
-            &backend,
-            &b_scan,
-            &sp_receiver,
-            &mut owned_outpoints,
-        )
-        .await?;
+        let (discovered_outputs, discovered_inputs) =
+            match process_block(
+                &blockdata,
+                &backend,
+                &b_scan,
+                &sp_receiver,
+                &mut owned_outpoints,
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    warn!("block processing failed for block {blkheight}: {e:#}");
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    continue;
+                }
+            };
 
         tx.send(ScanResult {
             blkheight,
             blkhash,
             discovered_inputs,
             discovered_outputs,
+            error: None,
         })
         .await?;
     }
 
     info!("Total number of tweaks processed: {tweak_count}");
     info!("Total number of blocks processed: {block_count}");
+
+    if let Some(e) = first_error {
+        log::error!(
+            "scan over range ending at {range_end} FAILED: {e:#} — \
+             reporting a terminal failure result to the consumer"
+        );
+        // Terminal failure marker: without it, a failed scan is
+        // indistinguishable from a completed scan that found nothing —
+        // exactly the silent-wrongness this marker exists to prevent.
+        let _ = tx
+            .send(ScanResult {
+                blkheight: range_end,
+                blkhash: BlockHash::from_slice(&[0u8; 32]).expect("32-byte all-zero hash"),
+                discovered_inputs: HashSet::new(),
+                discovered_outputs: HashMap::new(),
+                error: Some(format!("{e:#}")),
+            })
+            .await;
+    }
 
     Ok(())
 }
